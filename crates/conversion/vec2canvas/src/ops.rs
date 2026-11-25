@@ -985,10 +985,14 @@ impl CanvasOp for CanvasPathElem {
         let path = self.path.get_or_init(&self.path_data.d);
 
         if let Some(fill) = &self.fill {
-            if fill.fill_radial_path(canvas, ts, path) {
+            let clip_bounds = fill
+                .needs_stroked_outline_fill()
+                .then(|| crate::path_bounds(&self.path_data.d))
+                .flatten();
+            if fill.fill_radial_path(canvas, ts, path, clip_bounds) {
                 // Non-uniform radial gradients are drawn through a clipped
                 // paint transform to match SVG gradientTransform semantics.
-            } else if fill.fill_conic_path(canvas, ts, path, true) {
+            } else if fill.fill_conic_path(canvas, ts, path, clip_bounds, true) {
                 // Conic gradients fall back to segmented drawing when native
                 // canvas conics cannot represent the paint transform.
             } else {
@@ -1128,9 +1132,13 @@ impl CanvasGlyphElem {
     ) {
         if let Some(fill) = &self.fill {
             if !fill.is_unsupported() {
-                if fill.fill_radial_path(canvas, ts, path) {
+                let clip_bounds = fill
+                    .needs_stroked_outline_fill()
+                    .then(|| crate::path_bounds(outline_d))
+                    .flatten();
+                if fill.fill_radial_path(canvas, ts, path, clip_bounds) {
                     // Non-uniform or flipped radial gradient fills manage their own clipped paint state.
-                } else if fill.fill_conic_path(canvas, ts, path, true) {
+                } else if fill.fill_conic_path(canvas, ts, path, clip_bounds, true) {
                     // Conic gradient fills manage their own clipped paint state.
                 } else if set_transform(canvas, ts) {
                     fill.set_fill_style(canvas, ts);
@@ -1142,15 +1150,23 @@ impl CanvasGlyphElem {
         if let Some(stroke) = &self.stroke {
             if !stroke.paint.is_unsupported() {
                 if stroke.paint.needs_stroked_outline_fill() {
-                    if let Some(stroked_path) =
+                    if let Some((stroked_path, stroked_bounds)) =
                         crate::stroked_outline_path_2d(outline_d, &stroke.attrs, ts)
                     {
-                        if stroke.paint.fill_radial_path(canvas, ts, &stroked_path) {
+                        if stroke.paint.fill_radial_path(
+                            canvas,
+                            ts,
+                            &stroked_path,
+                            Some(stroked_bounds),
+                        ) {
                             // Non-uniform or flipped radial gradient strokes render through the expanded stroke outline.
-                        } else if stroke
-                            .paint
-                            .fill_conic_path(canvas, ts, &stroked_path, true)
-                        {
+                        } else if stroke.paint.fill_conic_path(
+                            canvas,
+                            ts,
+                            &stroked_path,
+                            Some(stroked_bounds),
+                            true,
+                        ) {
                             // Conic gradient strokes render through the expanded stroke outline.
                         }
                     }

@@ -16,7 +16,7 @@ use typst::{
 };
 use web_sys::{CanvasGradient, Path2d};
 
-use crate::{set_transform, CanvasDevice, CanvasStateGuard, CanvasStrokeAttrs};
+use crate::{CanvasDevice, CanvasStateGuard, CanvasStrokeAttrs};
 
 const TAU: f32 = std::f32::consts::TAU;
 const CONIC_SEGMENT: usize = 360;
@@ -107,13 +107,14 @@ impl CanvasPaint {
         canvas: &dyn CanvasDevice,
         ts: sk::Transform,
         clip_path: &Path2d,
+        clip_bounds: Option<sk::Rect>,
         prefer_native: bool,
     ) -> bool {
         match self {
             Self::Gradient(gradient)
                 if matches!(gradient.gradient.kind, GradientKind::Conic(_)) =>
             {
-                gradient.fill_conic_path(canvas, ts, clip_path, prefer_native);
+                gradient.fill_conic_path(canvas, ts, clip_path, clip_bounds, prefer_native);
                 true
             }
             Self::Solid(_) | Self::Gradient(_) | Self::Unsupported => false,
@@ -125,6 +126,7 @@ impl CanvasPaint {
         canvas: &dyn CanvasDevice,
         ts: sk::Transform,
         clip_path: &Path2d,
+        clip_bounds: Option<sk::Rect>,
     ) -> bool {
         match self {
             Self::Gradient(gradient)
@@ -133,17 +135,16 @@ impl CanvasPaint {
                         .transform
                         .is_some_and(|transform| !can_use_native_circular_gradient(transform)) =>
             {
-                gradient.fill_radial_path(canvas, ts, clip_path);
+                gradient.fill_radial_path(canvas, ts, clip_path, clip_bounds);
                 true
             }
             Self::Solid(_) | Self::Gradient(_) | Self::Unsupported => false,
         }
     }
 
-    /// Returns true when stroking a glyph path with this paint cannot rely on
-    /// `CanvasRenderingContext2D::strokeStyle` alone because the gradient's
-    /// transform (non-uniform scale, Y-flip, rotation, or conic angle) must be
-    /// applied via `fill_radial_path` / `fill_conic_path` on an expanded stroke outline.
+    /// Returns true when painting a path/glyph with this paint requires the
+    /// clipped paint-transform path (`fill_radial_path` / `fill_conic_path`)
+    /// rather than direct `CanvasRenderingContext2D` fill/stroke styles.
     pub fn needs_stroked_outline_fill(&self) -> bool {
         match self {
             Self::Gradient(gradient) => match gradient.gradient.kind {
@@ -158,11 +159,15 @@ impl CanvasPaint {
     }
 }
 
-pub(crate) fn expand_stroked_outline_svg(
+pub(crate) fn path_bounds(path_data: &str) -> Option<sk::Rect> {
+    convert_path(path_data).map(|path| path.bounds())
+}
+
+pub(crate) fn expand_stroked_outline(
     path_data: &str,
     attrs: &CanvasStrokeAttrs,
     resolution_scale: f32,
-) -> Option<String> {
+) -> Option<(String, sk::Rect)> {
     if !attrs.width.0.is_finite() || attrs.width.0 <= 0.0 {
         return None;
     }
@@ -207,17 +212,20 @@ pub(crate) fn expand_stroked_outline_svg(
     };
 
     let stroked = path.stroke(&sk_stroke, res_scale)?;
-    path_to_svg_string(&stroked)
+    let bounds = stroked.bounds();
+    let svg = path_to_svg_string(&stroked)?;
+    Some((svg, bounds))
 }
 
 pub(crate) fn stroked_outline_path_2d(
     path_data: &str,
     attrs: &CanvasStrokeAttrs,
     ts: sk::Transform,
-) -> Option<Path2d> {
+) -> Option<(Path2d, sk::Rect)> {
     let res_scale = tiny_skia_path::PathStroker::compute_resolution_scale(&ts);
-    let svg = expand_stroked_outline_svg(path_data, attrs, res_scale)?;
-    Path2d::new_with_path_string(&svg).ok()
+    let (svg, bounds) = expand_stroked_outline(path_data, attrs, res_scale)?;
+    let path = Path2d::new_with_path_string(&svg).ok()?;
+    Some((path, bounds))
 }
 
 fn path_to_svg_string(path: &tiny_skia_path::Path) -> Option<String> {
@@ -346,6 +354,7 @@ impl CanvasGradientPaint {
         canvas: &dyn CanvasDevice,
         ts: sk::Transform,
         clip_path: &Path2d,
+        clip_bounds: Option<sk::Rect>,
         prefer_native: bool,
     ) {
         let GradientKind::Conic(angle) = self.gradient.kind else {
@@ -361,68 +370,52 @@ impl CanvasGradientPaint {
         }
 
         if prefer_native {
-            let paint_transform: sk::Transform = transform.into();
-            let screen_transform = ts.pre_concat(paint_transform);
-            let vx_x = f64::from(screen_transform.sx);
-            let vx_y = f64::from(screen_transform.ky);
-            let vy_x = f64::from(screen_transform.kx);
-            let vy_y = f64::from(screen_transform.sy);
-            let w_px = vx_x.hypot(vx_y);
-            let h_px = vy_x.hypot(vy_y);
-            let dot = vx_x * vy_x + vx_y * vy_y;
-            let orthogonal = w_px.is_finite()
-                && h_px.is_finite()
-                && w_px > 1e-6
-                && h_px > 1e-6
-                && dot.abs() <= 1e-3 * w_px * h_px;
-
-            if orthogonal {
+            let paint_to_local = conic_paint_to_local(transform, self.aspect_ratio, center, ts);
+            let canvas_transform = ts.pre_concat(paint_to_local);
+            if is_invertible_sk_transform(canvas_transform) {
                 if let Some(gradient) =
                     canvas.create_conic_gradient((std::f32::consts::PI + angle.0) as f64, 0.0, 0.0)
                 {
                     append_color_stops(&gradient, &self.gradient);
 
                     let _guard = CanvasStateGuard::new(canvas);
-                    if !set_transform(canvas, ts) {
+                    if !set_invertible_transform(canvas, ts) {
                         return;
                     }
                     canvas.clip_with_path_2d(clip_path);
 
-                    let cx = vx_x * f64::from(center.x.0)
-                        + vy_x * f64::from(center.y.0)
-                        + f64::from(screen_transform.tx);
-                    let cy = vx_y * f64::from(center.x.0)
-                        + vy_y * f64::from(center.y.0)
-                        + f64::from(screen_transform.ty);
-                    let ux_x = vx_x / w_px;
-                    let ux_y = vx_y / w_px;
-                    let uy_x = vy_x / h_px;
-                    let uy_y = vy_y / h_px;
-                    let extent = w_px.max(h_px) * 4.0;
-                    if cx.is_finite() && cy.is_finite() && extent.is_finite() && extent > 0.0 {
-                        canvas.set_transform(ux_x, ux_y, uy_x, uy_y, cx, cy);
-                        canvas.set_fill_style_canvas_gradient(&gradient);
-                        canvas.fill_rect(-extent, -extent, extent * 2.0, extent * 2.0);
+                    if !set_invertible_transform(canvas, canvas_transform) {
                         return;
                     }
+
+                    let (x, y, w, h) = paint_space_fill_rect(clip_bounds, paint_to_local);
+                    canvas.set_fill_style_canvas_gradient(&gradient);
+                    canvas.fill_rect(x, y, w, h);
+                    return;
                 }
             }
         }
 
-        let aspect_ratio = gradient_aspect_ratio(
-            self.aspect_ratio
-                .or_else(|| self.transform.map(transform_aspect_ratio)),
-        );
+        let aspect_ratio = resolve_conic_aspect_ratio(transform, self.aspect_ratio, ts);
         let inverse_ratio = 1.0 / aspect_ratio;
 
-        let rx = 2.0 * transform.sx.0.hypot(transform.ky.0);
-        let ry = 2.0 * transform.kx.0.hypot(transform.sy.0);
+        let (fill_x, fill_y, fill_w, fill_h) = paint_space_fill_rect(clip_bounds, transform.into());
+        let max_dx = (fill_x - f64::from(center.x.0))
+            .abs()
+            .max((fill_x + fill_w - f64::from(center.x.0)).abs());
+        let max_dy = (fill_y - f64::from(center.y.0))
+            .abs()
+            .max((fill_y + fill_h - f64::from(center.y.0)).abs());
+        let radius_unit = max_dx.hypot(max_dy).max(2.0) as f32;
+
+        let rx = radius_unit * transform.sx.0.hypot(transform.ky.0);
+        let ry = radius_unit * transform.kx.0.hypot(transform.sy.0);
         if rx == 0.0 || ry == 0.0 {
             return;
         }
 
         let _guard = CanvasStateGuard::new(canvas);
-        if !set_transform(canvas, ts) {
+        if !set_invertible_transform(canvas, ts) {
             return;
         }
         canvas.clip_with_path_2d(clip_path);
@@ -432,8 +425,8 @@ impl CanvasGradientPaint {
         for i in 0..CONIC_SEGMENT {
             let (theta1, theta2) = conic_segment_angles(angle.0, dtheta, inverse_ratio, i);
             let center_point = (center.x.0, center.y.0);
-            let segment_start = conic_segment_point(center_point, theta1);
-            let segment_end = conic_segment_point(center_point, theta2);
+            let segment_start = conic_segment_point_with_radius(center_point, theta1, radius_unit);
+            let segment_end = conic_segment_point_with_radius(center_point, theta2, radius_unit);
             let (cx, cy) = transform_point(transform, center.x.0 as f64, center.y.0 as f64);
             let (x1, y1) =
                 transform_point(transform, segment_start.0 as f64, segment_start.1 as f64);
@@ -464,7 +457,13 @@ impl CanvasGradientPaint {
         }
     }
 
-    fn fill_radial_path(&self, canvas: &dyn CanvasDevice, ts: sk::Transform, clip_path: &Path2d) {
+    fn fill_radial_path(
+        &self,
+        canvas: &dyn CanvasDevice,
+        ts: sk::Transform,
+        clip_path: &Path2d,
+        clip_bounds: Option<sk::Rect>,
+    ) {
         let GradientKind::Radial(radius) = self.gradient.kind else {
             return;
         };
@@ -495,19 +494,159 @@ impl CanvasGradientPaint {
         append_color_stops(&gradient, &self.gradient);
 
         let _guard = CanvasStateGuard::new(canvas);
-        if !set_transform(canvas, ts) {
+        if !set_invertible_transform(canvas, ts) {
             return;
         }
         canvas.clip_with_path_2d(clip_path);
 
         let paint_transform: sk::Transform = transform.into();
-        if !set_transform(canvas, ts.pre_concat(paint_transform)) {
+        if !set_invertible_transform(canvas, ts.pre_concat(paint_transform)) {
             return;
         }
 
+        let (x, y, w, h) = paint_space_fill_rect(clip_bounds, paint_transform);
         canvas.set_fill_style_canvas_gradient(&gradient);
-        canvas.fill_rect(-4.0, -4.0, 8.0, 8.0);
+        canvas.fill_rect(x, y, w, h);
     }
+}
+
+fn is_invertible_sk_transform(m: sk::Transform) -> bool {
+    if !m.sx.is_finite()
+        || !m.ky.is_finite()
+        || !m.kx.is_finite()
+        || !m.sy.is_finite()
+        || !m.tx.is_finite()
+        || !m.ty.is_finite()
+    {
+        return false;
+    }
+    let det = f64::from(m.sx) * f64::from(m.sy) - f64::from(m.kx) * f64::from(m.ky);
+    det.is_finite() && det.abs() > 1e-12
+}
+
+fn set_invertible_transform(canvas: &dyn CanvasDevice, m: sk::Transform) -> bool {
+    if !is_invertible_sk_transform(m) {
+        return false;
+    }
+    canvas.set_transform(
+        f64::from(m.sx),
+        f64::from(m.ky),
+        f64::from(m.kx),
+        f64::from(m.sy),
+        f64::from(m.tx),
+        f64::from(m.ty),
+    );
+    true
+}
+
+fn is_orthogonal_sk_transform(m: sk::Transform) -> bool {
+    let w = f64::from(m.sx).hypot(f64::from(m.ky));
+    let h = f64::from(m.kx).hypot(f64::from(m.sy));
+    if !w.is_finite() || !h.is_finite() || w <= 1e-6 || h <= 1e-6 {
+        return false;
+    }
+    let dot = f64::from(m.sx) * f64::from(m.kx) + f64::from(m.ky) * f64::from(m.sy);
+    dot.abs() <= 1e-3 * w * h
+}
+
+fn valid_sk_transform_aspect_ratio(m: sk::Transform) -> Option<f32> {
+    let width = m.sx.hypot(m.ky);
+    let height = m.kx.hypot(m.sy);
+    if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+        let ratio = width / height;
+        ratio.is_finite().then_some(ratio)
+    } else {
+        None
+    }
+}
+
+fn resolve_conic_aspect_ratio(
+    transform: Transform,
+    aspect_ratio: Option<f32>,
+    ts: sk::Transform,
+) -> f32 {
+    let paint_transform: sk::Transform = transform.into();
+    if is_orthogonal_sk_transform(paint_transform) {
+        return gradient_aspect_ratio(
+            aspect_ratio.or_else(|| valid_transform_aspect_ratio(transform)),
+        );
+    }
+
+    let screen_transform = ts.pre_concat(paint_transform);
+    if is_orthogonal_sk_transform(screen_transform) {
+        if let Some(ratio) = valid_sk_transform_aspect_ratio(screen_transform) {
+            return gradient_aspect_ratio(Some(ratio));
+        }
+    }
+
+    gradient_aspect_ratio(aspect_ratio.or_else(|| valid_transform_aspect_ratio(transform)))
+}
+
+/// Maps isotropic conic-gradient circle space `(u, v)` centered at `(0, 0)` into
+/// the element's local coordinate space by first scaling `(1 / aspect_ratio, 1)`
+/// around `center` in parent `[0, 1]^2` space and then applying `paint_transform`.
+/// Composing `ts.pre_concat(conic_paint_to_local(...))` preserves parent aspect-ratio
+/// correction while keeping any outer `#scale`, `#rotate`, or `#skew` intact.
+pub(crate) fn conic_paint_to_local(
+    transform: Transform,
+    aspect_ratio: Option<f32>,
+    center: ir::Point,
+    ts: sk::Transform,
+) -> sk::Transform {
+    let ratio = resolve_conic_aspect_ratio(transform, aspect_ratio, ts);
+    let paint_transform: sk::Transform = transform.into();
+    let unit_circle_to_parent =
+        sk::Transform::from_row(1.0 / ratio, 0.0, 0.0, 1.0, center.x.0, center.y.0);
+    paint_transform.pre_concat(unit_circle_to_parent)
+}
+
+/// Computes a fill rectangle in paint space guaranteed to cover the clipped
+/// element's local `clip_bounds` (even when the element overflows a narrow
+/// parent box far past `[-4, 4]^2`).
+pub(crate) fn paint_space_fill_rect(
+    clip_bounds: Option<sk::Rect>,
+    paint_to_local: sk::Transform,
+) -> (f64, f64, f64, f64) {
+    if let (Some(bounds), Some(inv)) = (clip_bounds, paint_to_local.invert()) {
+        let mut corners = [
+            tiny_skia_path::Point::from_xy(bounds.left(), bounds.top()),
+            tiny_skia_path::Point::from_xy(bounds.right(), bounds.top()),
+            tiny_skia_path::Point::from_xy(bounds.right(), bounds.bottom()),
+            tiny_skia_path::Point::from_xy(bounds.left(), bounds.bottom()),
+        ];
+        inv.map_points(&mut corners);
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for pt in corners {
+            let x = f64::from(pt.x);
+            let y = f64::from(pt.y);
+            if !x.is_finite() || !y.is_finite() {
+                return (-4.0, -4.0, 8.0, 8.0);
+            }
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        let pad_x = ((max_x - min_x) * 0.05).max(1.0);
+        let pad_y = ((max_y - min_y) * 0.05).max(1.0);
+        let lo_x = min_x - pad_x;
+        let lo_y = min_y - pad_y;
+        let w = (max_x + pad_x) - lo_x;
+        let h = (max_y + pad_y) - lo_y;
+        if lo_x.is_finite()
+            && lo_y.is_finite()
+            && w.is_finite()
+            && h.is_finite()
+            && w > 0.0
+            && h > 0.0
+        {
+            return (lo_x, lo_y, w, h);
+        }
+    }
+    (-4.0, -4.0, 8.0, 8.0)
 }
 
 fn resolve_gradient(module: &Module, paint: &str) -> Option<CanvasGradientPaint> {
@@ -854,8 +993,11 @@ fn conic_segment_angles(angle: f32, dtheta: f32, inverse_ratio: f32, i: usize) -
     )
 }
 
-fn conic_segment_point(center: (f32, f32), theta: f32) -> (f32, f32) {
-    (-2.0 * theta.cos() + center.0, 2.0 * theta.sin() + center.1)
+fn conic_segment_point_with_radius(center: (f32, f32), theta: f32, radius: f32) -> (f32, f32) {
+    (
+        -radius * theta.cos() + center.0,
+        radius * theta.sin() + center.1,
+    )
 }
 
 fn linear_gradient_points(angle: f32, aspect_ratio: f32) -> (f64, f64, f64, f64) {

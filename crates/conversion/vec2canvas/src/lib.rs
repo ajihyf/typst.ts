@@ -1197,19 +1197,21 @@ mod tests {
         assert!(conic_stroke.paint.needs_stroked_outline_fill());
 
         let outline = "M 0 0 L 500 0 L 500 700 L 0 700 Z";
-        let solid_svg = crate::expand_stroked_outline_svg(outline, &radial_stroke.attrs, 0.2)
-            .expect("solid stroke expansion must produce non-empty SVG path");
+        let (solid_svg, solid_bounds) =
+            crate::expand_stroked_outline(outline, &radial_stroke.attrs, 0.2)
+                .expect("solid stroke expansion must produce non-empty SVG path");
         assert!(solid_svg.starts_with("M "));
         assert!(solid_svg.contains("Z "));
+        assert!(solid_bounds.left() < 0.0 && solid_bounds.right() > 500.0);
 
         // Odd-length dash array must duplicate cleanly and produce stroked dashes.
-        let dashed_svg = crate::expand_stroked_outline_svg(outline, &conic_stroke.attrs, 0.2)
+        let (dashed_svg, _) = crate::expand_stroked_outline(outline, &conic_stroke.attrs, 0.2)
             .expect("odd-length dashed stroke expansion must produce non-empty SVG path");
         assert!(dashed_svg.starts_with("M "));
         assert_ne!(solid_svg, dashed_svg);
 
         // Empty or zero-width paths return None cleanly.
-        assert!(crate::expand_stroked_outline_svg("", &radial_stroke.attrs, 0.2).is_none());
+        assert!(crate::expand_stroked_outline("", &radial_stroke.attrs, 0.2).is_none());
         let zero_attrs = CanvasStrokeAttrs {
             width: Scalar(0.0),
             line_cap: None,
@@ -1218,7 +1220,35 @@ mod tests {
             dash_array: None,
             dash_offset: None,
         };
-        assert!(crate::expand_stroked_outline_svg(outline, &zero_attrs, 0.2).is_none());
+        assert!(crate::expand_stroked_outline(outline, &zero_attrs, 0.2).is_none());
+
+        // Conic paint transform must preserve outer non-uniform scale (160% x, 60% y) on a
+        // 220x100 parent block rather than normalizing away the outer scale.
+        let parent_block_ts = ir::Transform::from_scale(Scalar(220.0), Scalar(100.0));
+        let outer_scaled_ts = sk::Transform::from_scale(3.0 * 1.6, 3.0 * 0.6);
+        let conic_local = crate::conic_paint_to_local(
+            parent_block_ts,
+            Some(2.2),
+            ir::Point::new(Scalar(0.37), Scalar(0.58)),
+            outer_scaled_ts,
+        );
+        let conic_screen = outer_scaled_ts.pre_concat(conic_local);
+        // X-axis stretches by 1.6x, Y-axis compresses by 0.6x relative to the block's isotropic 100pt unit!
+        assert!((conic_screen.sx / conic_screen.sy - (1.6 / 0.6)).abs() < 1e-3);
+
+        // Narrow parent box (14pt x 20pt) with wide overflowing glyph (75pt wide -> ~5.4x parent)
+        // must compute a paint-space fill_rect strictly covering the entire glyph past x=4.0.
+        let narrow_parent = sk::Transform::from_scale(14.0, 20.0);
+        let wide_clip = sk::Rect::from_ltrb(-4.0, -60.0, 75.0, 20.0).unwrap();
+        let (fx, fy, fw, fh) = crate::paint_space_fill_rect(Some(wide_clip), narrow_parent);
+        assert!(fx < -4.0 / 14.0);
+        assert!(
+            fx + fw > 75.0 / 14.0,
+            "must cover >5.35 parent widths: {fx}..{}",
+            fx + fw
+        );
+        assert!(fy < -60.0 / 20.0);
+        assert!(fy + fh > 20.0 / 20.0);
     }
 
     #[test]
