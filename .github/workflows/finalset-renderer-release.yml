@@ -29,8 +29,11 @@ jobs:
           target: wasm32-unknown-unknown
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | bash
-      - name: Run reflexo-vec2canvas tests
-        run: cargo test -p reflexo-vec2canvas
+      - name: Run reflexo-vec2canvas clippy and tests
+        run: |
+          cargo clippy -p reflexo-vec2canvas --all-targets -- -D warnings
+          cargo test -p reflexo-vec2canvas
+          cargo test -p reflexo-vec2canvas --features rasterize_glyph
       - name: Build and pack @myriaddreamin/typst-ts-renderer
         run: bash scripts/build-finalset-renderer.sh
       - name: Upload workflow artifact
@@ -46,9 +49,9 @@ jobs:
         run: |
           TARBALL="$(ls packages/renderer/*.tgz | head -n 1)"
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" "${TARBALL}" --clobber
-          else
-            gh release create "${RELEASE_TAG}" "${TARBALL}" \
-              --title "${RELEASE_TAG}" \
-              --notes "Finalset fork build of \`@myriaddreamin/typst-ts-renderer\` with native \`reflexo-vec2canvas\` \`TextItem\` stroke rendering."
+            echo "Error: release ${RELEASE_TAG} already exists; refusing to overwrite published tarball" >&2
+            exit 1
           fi
+          gh release create "${RELEASE_TAG}" "${TARBALL}" \
+            --title "${RELEASE_TAG}" \
+            --notes "Finalset fork build of \`@myriaddreamin/typst-ts-renderer\` with native \`reflexo-vec2canvas\` \`TextItem\` stroke rendering."

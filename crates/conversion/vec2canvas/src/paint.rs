@@ -16,7 +16,7 @@ use typst::{
 };
 use web_sys::{CanvasGradient, Path2d};
 
-use crate::{set_transform, CanvasDevice, CanvasStateGuard};
+use crate::{set_transform, CanvasDevice, CanvasStateGuard, CanvasStrokeAttrs};
 
 const TAU: f32 = std::f32::consts::TAU;
 const CONIC_SEGMENT: usize = 360;
@@ -139,6 +139,134 @@ impl CanvasPaint {
             Self::Solid(_) | Self::Gradient(_) | Self::Unsupported => false,
         }
     }
+
+    /// Returns true when stroking a glyph path with this paint cannot rely on
+    /// `CanvasRenderingContext2D::strokeStyle` alone because the gradient's
+    /// transform (non-uniform scale, Y-flip, rotation, or conic angle) must be
+    /// applied via `fill_radial_path` / `fill_conic_path` on an expanded stroke outline.
+    pub fn needs_stroked_outline_fill(&self) -> bool {
+        match self {
+            Self::Gradient(gradient) => match gradient.gradient.kind {
+                GradientKind::Conic(_) => true,
+                GradientKind::Radial(_) => gradient
+                    .transform
+                    .is_some_and(|transform| !can_use_native_circular_gradient(transform)),
+                GradientKind::Linear(_) => false,
+            },
+            Self::Solid(_) | Self::Unsupported => false,
+        }
+    }
+}
+
+pub(crate) fn expand_stroked_outline_svg(
+    path_data: &str,
+    attrs: &CanvasStrokeAttrs,
+    resolution_scale: f32,
+) -> Option<String> {
+    if !attrs.width.0.is_finite() || attrs.width.0 <= 0.0 {
+        return None;
+    }
+
+    let mut path = convert_path(path_data)?;
+    let res_scale = if resolution_scale.is_finite() && resolution_scale > 0.0 {
+        resolution_scale
+    } else {
+        1.0
+    };
+
+    if let Some(dash_array) = attrs.dash_array.as_deref() {
+        if !dash_array.is_empty() {
+            let mut intervals: Vec<f32> = dash_array.iter().map(|d| d.0).collect();
+            if intervals.len() % 2 == 1 {
+                intervals.extend_from_within(..);
+            }
+            let offset = attrs.dash_offset.map_or(0.0, |o| o.0);
+            if let Some(dash) = tiny_skia_path::StrokeDash::new(intervals, offset) {
+                path = path.dash(&dash, res_scale)?;
+            }
+        }
+    }
+
+    let line_cap = match attrs.line_cap.as_deref() {
+        Some("round") => tiny_skia_path::LineCap::Round,
+        Some("square") => tiny_skia_path::LineCap::Square,
+        _ => tiny_skia_path::LineCap::Butt,
+    };
+    let line_join = match attrs.line_join.as_deref() {
+        Some("round") => tiny_skia_path::LineJoin::Round,
+        Some("bevel") => tiny_skia_path::LineJoin::Bevel,
+        _ => tiny_skia_path::LineJoin::Miter,
+    };
+    let miter_limit = attrs.miter_limit.map_or(10.0, |limit| limit.0).max(0.0);
+    let sk_stroke = tiny_skia_path::Stroke {
+        width: attrs.width.0,
+        miter_limit,
+        line_cap,
+        line_join,
+        dash: None,
+    };
+
+    let stroked = path.stroke(&sk_stroke, res_scale)?;
+    path_to_svg_string(&stroked)
+}
+
+pub(crate) fn stroked_outline_path_2d(
+    path_data: &str,
+    attrs: &CanvasStrokeAttrs,
+    ts: sk::Transform,
+) -> Option<Path2d> {
+    let res_scale = tiny_skia_path::PathStroker::compute_resolution_scale(&ts);
+    let svg = expand_stroked_outline_svg(path_data, attrs, res_scale)?;
+    Path2d::new_with_path_string(&svg).ok()
+}
+
+fn path_to_svg_string(path: &tiny_skia_path::Path) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for segment in path.segments() {
+        match segment {
+            tiny_skia_path::PathSegment::MoveTo(p) => {
+                if !p.x.is_finite() || !p.y.is_finite() {
+                    return None;
+                }
+                let _ = write!(out, "M {} {} ", p.x, p.y);
+            }
+            tiny_skia_path::PathSegment::LineTo(p) => {
+                if !p.x.is_finite() || !p.y.is_finite() {
+                    return None;
+                }
+                let _ = write!(out, "L {} {} ", p.x, p.y);
+            }
+            tiny_skia_path::PathSegment::QuadTo(p1, p) => {
+                if !p1.x.is_finite() || !p1.y.is_finite() || !p.x.is_finite() || !p.y.is_finite() {
+                    return None;
+                }
+                let _ = write!(out, "Q {} {} {} {} ", p1.x, p1.y, p.x, p.y);
+            }
+            tiny_skia_path::PathSegment::CubicTo(p1, p2, p) => {
+                if !p1.x.is_finite()
+                    || !p1.y.is_finite()
+                    || !p2.x.is_finite()
+                    || !p2.y.is_finite()
+                    || !p.x.is_finite()
+                    || !p.y.is_finite()
+                {
+                    return None;
+                }
+                let _ = write!(
+                    out,
+                    "C {} {} {} {} {} {} ",
+                    p1.x, p1.y, p2.x, p2.y, p.x, p.y
+                );
+            }
+            tiny_skia_path::PathSegment::Close => {
+                out.push_str("Z ");
+            }
+        }
+    }
+
+    (!out.is_empty()).then_some(out)
 }
 
 impl CanvasGradientPaint {
@@ -233,27 +361,51 @@ impl CanvasGradientPaint {
         }
 
         if prefer_native {
-            if let Some(gradient) = canvas.create_conic_gradient(
-                (std::f32::consts::PI + angle.0) as f64,
-                center.x.0 as f64,
-                center.y.0 as f64,
-            ) {
-                append_color_stops(&gradient, &self.gradient);
+            let paint_transform: sk::Transform = transform.into();
+            let screen_transform = ts.pre_concat(paint_transform);
+            let vx_x = f64::from(screen_transform.sx);
+            let vx_y = f64::from(screen_transform.ky);
+            let vy_x = f64::from(screen_transform.kx);
+            let vy_y = f64::from(screen_transform.sy);
+            let w_px = vx_x.hypot(vx_y);
+            let h_px = vy_x.hypot(vy_y);
+            let dot = vx_x * vy_x + vx_y * vy_y;
+            let orthogonal = w_px.is_finite()
+                && h_px.is_finite()
+                && w_px > 1e-6
+                && h_px > 1e-6
+                && dot.abs() <= 1e-3 * w_px * h_px;
 
-                let _guard = CanvasStateGuard::new(canvas);
-                if !set_transform(canvas, ts) {
-                    return;
+            if orthogonal {
+                if let Some(gradient) =
+                    canvas.create_conic_gradient((std::f32::consts::PI + angle.0) as f64, 0.0, 0.0)
+                {
+                    append_color_stops(&gradient, &self.gradient);
+
+                    let _guard = CanvasStateGuard::new(canvas);
+                    if !set_transform(canvas, ts) {
+                        return;
+                    }
+                    canvas.clip_with_path_2d(clip_path);
+
+                    let cx = vx_x * f64::from(center.x.0)
+                        + vy_x * f64::from(center.y.0)
+                        + f64::from(screen_transform.tx);
+                    let cy = vx_y * f64::from(center.x.0)
+                        + vy_y * f64::from(center.y.0)
+                        + f64::from(screen_transform.ty);
+                    let ux_x = vx_x / w_px;
+                    let ux_y = vx_y / w_px;
+                    let uy_x = vy_x / h_px;
+                    let uy_y = vy_y / h_px;
+                    let extent = w_px.max(h_px) * 4.0;
+                    if cx.is_finite() && cy.is_finite() && extent.is_finite() && extent > 0.0 {
+                        canvas.set_transform(ux_x, ux_y, uy_x, uy_y, cx, cy);
+                        canvas.set_fill_style_canvas_gradient(&gradient);
+                        canvas.fill_rect(-extent, -extent, extent * 2.0, extent * 2.0);
+                        return;
+                    }
                 }
-                canvas.clip_with_path_2d(clip_path);
-
-                let paint_transform: sk::Transform = transform.into();
-                if !set_transform(canvas, ts.pre_concat(paint_transform)) {
-                    return;
-                }
-
-                canvas.set_fill_style_canvas_gradient(&gradient);
-                canvas.fill_rect(-4.0, -4.0, 8.0, 8.0);
-                return;
             }
         }
 

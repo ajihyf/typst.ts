@@ -360,18 +360,20 @@ impl<'m, Feat: ExportFeature> RenderVm<'m> for CanvasRenderTask<'m, '_, Feat> {
             }
         }
 
-        let stroke_pad = g
-            .stroke
-            .as_ref()
-            .map_or(0.0, |(_, attrs)| attrs.bbox_padding());
-        g.rect = {
+        g.rect = if g.stroke.is_some() {
+            // Stroked glyphs (e.g. italic overhangs such as `f` with thick strokes) can extend
+            // outside the advance-based font metric box. Use a dynamic group bbox so
+            // `CanvasGroupElem::bbox_at` unions every inner glyph's stroke-padded outline bounds
+            // before windowed culling runs.
+            CanvasBBox::Dynamic(Box::new(OnceCell::new()))
+        } else {
             // upem is the unit per em defined in the font.
             let accender = Scalar(font.ascender.0) * upem;
 
             // todo: glyphs like macron has zero width... why?
             let w = text.width();
 
-            let base_rect = if text.shape.size.0 == 0. {
+            let rect = if text.shape.size.0 == 0. {
                 Rect {
                     lo: Point::new(Scalar(0.), accender - upem),
                     hi: Point::new(Scalar(0.), accender),
@@ -383,20 +385,6 @@ impl<'m, Feat: ExportFeature> RenderVm<'m> for CanvasRenderTask<'m, '_, Feat> {
                 }
             }
             .cano();
-            let rect = if stroke_pad > 0.0 {
-                Rect {
-                    lo: Point::new(
-                        Scalar(base_rect.lo.x.0 - stroke_pad),
-                        Scalar(base_rect.lo.y.0 - stroke_pad),
-                    ),
-                    hi: Point::new(
-                        Scalar(base_rect.hi.x.0 + stroke_pad),
-                        Scalar(base_rect.hi.y.0 + stroke_pad),
-                    ),
-                }
-            } else {
-                base_rect
-            };
             CanvasBBox::Static(Box::new(rect))
         };
         g.glyph_scale = Some(Scalar(text.shape.size.0 / upem.0));
@@ -866,11 +854,14 @@ mod tests {
         assert!((glyph_bbox.lo.y.0 - (-15.0)).abs() < 1e-3);
         assert!((glyph_bbox.hi.y.0 - 715.0).abs() < 1e-3);
 
+        // Stroked text group uses dynamic outline bbox scaled by (10/1000, -10/1000).
         let group_bbox = group
             .bbox_at(sk::Transform::identity())
             .expect("group bbox");
-        assert!(group_bbox.lo.x.0 < -0.1);
-        assert!(group_bbox.hi.x.0 > 10.1);
+        assert!((group_bbox.lo.x.0 - (-0.15)).abs() < 1e-3);
+        assert!((group_bbox.hi.x.0 - 5.15).abs() < 1e-3);
+        assert!((group_bbox.lo.y.0 - (-7.15)).abs() < 1e-3);
+        assert!((group_bbox.hi.y.0 - 0.15).abs() < 1e-3);
     }
 
     #[test]
@@ -1078,10 +1069,237 @@ mod tests {
             g_grad.stroke.as_ref().map(|s| &s.paint),
             Some(CanvasPaint::Gradient(_))
         ));
+        assert!(
+            !g_grad
+                .stroke
+                .as_ref()
+                .unwrap()
+                .paint
+                .needs_stroked_outline_fill(),
+            "linear gradient stroke keeps native createLinearGradient fast path"
+        );
         #[cfg(not(feature = "rasterize_glyph"))]
         assert!(
             _grad_group.solid_text_run_style().is_none(),
             "gradient stroke must fall back to per-glyph CanvasGlyphElem::realize"
+        );
+    }
+
+    #[test]
+    fn radial_and_conic_glyph_strokes_require_expanded_outline_fill_and_expand_stroke_svg() {
+        let fg_radial = Fingerprint::from_u128(30);
+        let fg_radial_ts = Fingerprint::from_u128(31);
+        let fg_conic = Fingerprint::from_u128(32);
+        let fg_conic_ts = Fingerprint::from_u128(33);
+        let fg_radial_text = Fingerprint::from_u128(34);
+        let fg_conic_text = Fingerprint::from_u128(35);
+
+        let stops = vec![
+            (
+                Rgba8Item {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                Scalar(0.0),
+            ),
+            (
+                Rgba8Item {
+                    r: 0,
+                    g: 0,
+                    b: 255,
+                    a: 255,
+                },
+                Scalar(1.0),
+            ),
+        ];
+
+        let mut items = ItemMap::default();
+        items.insert(
+            fg_radial,
+            VecItem::Gradient(Arc::new(GradientItem {
+                stops: stops.clone(),
+                space: reflexo::vector::ir::ColorSpace::Oklab,
+                anti_alias: true,
+                kind: GradientKind::Radial(Scalar(0.5)),
+                styles: vec![],
+            })),
+        );
+        items.insert(
+            fg_radial_ts,
+            VecItem::ColorTransform(Arc::new(ir::ColorTransform {
+                transform: ir::Transform::from_scale(Scalar(240.0), Scalar(120.0)),
+                item: fg_radial,
+            })),
+        );
+        items.insert(
+            fg_conic,
+            VecItem::Gradient(Arc::new(GradientItem {
+                stops,
+                space: reflexo::vector::ir::ColorSpace::Oklab,
+                anti_alias: true,
+                kind: GradientKind::Conic(Scalar(0.0)),
+                styles: vec![],
+            })),
+        );
+        items.insert(
+            fg_conic_ts,
+            VecItem::ColorTransform(Arc::new(ir::ColorTransform {
+                transform: ir::Transform::from_scale(Scalar(240.0), Scalar(120.0)),
+                item: fg_conic,
+            })),
+        );
+
+        let radial_ref: ImmutStr = format!("@{}", fg_radial_ts.as_svg_id("g")).into();
+        let conic_ref: ImmutStr = format!("@{}", fg_conic_ts.as_svg_id("g")).into();
+        items.insert(
+            fg_radial_text,
+            make_text_item(
+                72.0,
+                vec![
+                    PathStyle::Stroke(radial_ref),
+                    PathStyle::StrokeWidth(Scalar(8.0)),
+                ],
+            ),
+        );
+        items.insert(
+            fg_conic_text,
+            make_text_item(
+                72.0,
+                vec![
+                    PathStyle::Stroke(conic_ref),
+                    PathStyle::StrokeWidth(Scalar(5.0)),
+                    PathStyle::StrokeLineCap("round".into()),
+                    PathStyle::StrokeLineJoin("round".into()),
+                    PathStyle::StrokeDashArray(Arc::from([Scalar(6.0)])),
+                    PathStyle::StrokeDashOffset(Scalar(1.5)),
+                ],
+            ),
+        );
+
+        let module = Module {
+            fonts: vec![test_font()],
+            glyphs: vec![],
+            items,
+        };
+        let mut task = CanvasTask::<DefaultExportFeature>::default();
+        let mut render = task.fork_canvas_render_task(&module);
+
+        let radial_node = render.render_item(&fg_radial_text);
+        let (_, radial_glyph) = extract_single_glyph(&radial_node);
+        let radial_stroke = radial_glyph.stroke.as_ref().expect("radial stroke");
+        assert!(radial_stroke.paint.needs_stroked_outline_fill());
+
+        let conic_node = render.render_item(&fg_conic_text);
+        let (_, conic_glyph) = extract_single_glyph(&conic_node);
+        let conic_stroke = conic_glyph.stroke.as_ref().expect("conic stroke");
+        assert!(conic_stroke.paint.needs_stroked_outline_fill());
+
+        let outline = "M 0 0 L 500 0 L 500 700 L 0 700 Z";
+        let solid_svg = crate::expand_stroked_outline_svg(outline, &radial_stroke.attrs, 0.2)
+            .expect("solid stroke expansion must produce non-empty SVG path");
+        assert!(solid_svg.starts_with("M "));
+        assert!(solid_svg.contains("Z "));
+
+        // Odd-length dash array must duplicate cleanly and produce stroked dashes.
+        let dashed_svg = crate::expand_stroked_outline_svg(outline, &conic_stroke.attrs, 0.2)
+            .expect("odd-length dashed stroke expansion must produce non-empty SVG path");
+        assert!(dashed_svg.starts_with("M "));
+        assert_ne!(solid_svg, dashed_svg);
+
+        // Empty or zero-width paths return None cleanly.
+        assert!(crate::expand_stroked_outline_svg("", &radial_stroke.attrs, 0.2).is_none());
+        let zero_attrs = CanvasStrokeAttrs {
+            width: Scalar(0.0),
+            line_cap: None,
+            line_join: None,
+            miter_limit: None,
+            dash_array: None,
+            dash_offset: None,
+        };
+        assert!(crate::expand_stroked_outline_svg(outline, &zero_attrs, 0.2).is_none());
+    }
+
+    #[test]
+    fn stroked_text_group_bbox_covers_italic_overhang_past_advance() {
+        // Simulate an italic `f` whose advance is narrow (300 upem) while its outline overhangs
+        // well to the left (-180 upem) and right (+680 upem) and vertically (-220..+920 upem).
+        let italic_f_outline = Arc::new(FlatGlyphItem::Outline(Arc::new(OutlineGlyphItem {
+            ts: None,
+            d: "M -180 -220 L 680 -220 L 680 920 L -180 920 Z".into(),
+            ligature_len: 1,
+        })));
+        let font = FontItem {
+            fingerprint: Fingerprint::from_u128(0x5678),
+            family: "TestItalic".into(),
+            hash: 2,
+            cap_height: Scalar(0.7),
+            ascender: Scalar(0.88),
+            descender: Scalar(-0.12),
+            units_per_em: Scalar(1000.0),
+            vertical: false,
+            glyphs: vec![italic_f_outline],
+            glyph_cov: Default::default(),
+        };
+
+        let fg_text = Fingerprint::from_u128(40);
+        let size = 76.0_f32;
+        let advance_pt = 0.3 * size; // 22.8 pt, while right overhang reaches 0.68 * 76 = 51.68 pt!
+        let mut items = ItemMap::default();
+        items.insert(
+            fg_text,
+            VecItem::Text(TextItem {
+                content: Arc::new(TextItemContent {
+                    content: "f".into(),
+                    glyphs: Arc::from([(
+                        Axes::new(Scalar(0.0), Scalar(0.0)),
+                        Axes::new(Scalar(advance_pt), Scalar(0.0)),
+                        0u32,
+                    )]),
+                }),
+                shape: Arc::new(TextShape {
+                    font: FontRef { hash: 2, idx: 0 },
+                    dir: "ltr".into(),
+                    size: Scalar(size),
+                    styles: vec![
+                        PathStyle::Stroke("#e60012".into()),
+                        PathStyle::StrokeWidth(Scalar(5.0)),
+                        PathStyle::StrokeLineCap("round".into()),
+                        PathStyle::StrokeLineJoin("round".into()),
+                    ],
+                }),
+            }),
+        );
+
+        let module = Module {
+            fonts: vec![font],
+            glyphs: vec![],
+            items,
+        };
+        let mut task = CanvasTask::<DefaultExportFeature>::default();
+        let mut render = task.fork_canvas_render_task(&module);
+        let node = render.render_item(&fg_text);
+
+        // At 3 px/pt, right overhang + 2.5 pt half-stroke reaches (51.68 + 2.5) * 3 = 162.54 px,
+        // far beyond the advance-only static bound ((22.8 + 2.5) * 3 = 75.9 px).
+        let page_ts = sk::Transform::from_scale(3.0, 3.0);
+        let bbox = node.bbox_at(page_ts).expect("stroked text group bbox");
+        assert!(
+            bbox.lo.x.0 <= (-0.18 * size - 2.5) * 3.0 + 1e-2,
+            "left overhang + stroke must be covered: {bbox:?}"
+        );
+        assert!(
+            bbox.hi.x.0 >= (0.68 * size + 2.5) * 3.0 - 1e-2,
+            "right italic overhang + stroke must be covered: {bbox:?}"
+        );
+        assert!(
+            bbox.lo.y.0 <= (-0.92 * size - 2.5) * 3.0 + 1e-2,
+            "top overhang + stroke must be covered: {bbox:?}"
+        );
+        assert!(
+            bbox.hi.y.0 >= (0.22 * size + 2.5) * 3.0 - 1e-2,
+            "bottom descender overhang + stroke must be covered: {bbox:?}"
         );
     }
 }

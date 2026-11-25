@@ -1119,10 +1119,18 @@ pub struct CanvasGlyphElem {
 }
 
 impl CanvasGlyphElem {
-    fn realize_outline_path(&self, path: &Path2d, ts: sk::Transform, canvas: &dyn CanvasDevice) {
+    fn realize_outline_path(
+        &self,
+        outline_d: &str,
+        path: &Path2d,
+        ts: sk::Transform,
+        canvas: &dyn CanvasDevice,
+    ) {
         if let Some(fill) = &self.fill {
             if !fill.is_unsupported() {
-                if fill.fill_conic_path(canvas, ts, path, false) {
+                if fill.fill_radial_path(canvas, ts, path) {
+                    // Non-uniform or flipped radial gradient fills manage their own clipped paint state.
+                } else if fill.fill_conic_path(canvas, ts, path, true) {
                     // Conic gradient fills manage their own clipped paint state.
                 } else if set_transform(canvas, ts) {
                     fill.set_fill_style(canvas, ts);
@@ -1132,10 +1140,25 @@ impl CanvasGlyphElem {
         }
 
         if let Some(stroke) = &self.stroke {
-            if !stroke.paint.is_unsupported() && set_transform(canvas, ts) {
-                stroke.paint.set_stroke_style(canvas, ts);
-                stroke.attrs.apply(canvas);
-                canvas.stroke_with_path(path);
+            if !stroke.paint.is_unsupported() {
+                if stroke.paint.needs_stroked_outline_fill() {
+                    if let Some(stroked_path) =
+                        crate::stroked_outline_path_2d(outline_d, &stroke.attrs, ts)
+                    {
+                        if stroke.paint.fill_radial_path(canvas, ts, &stroked_path) {
+                            // Non-uniform or flipped radial gradient strokes render through the expanded stroke outline.
+                        } else if stroke
+                            .paint
+                            .fill_conic_path(canvas, ts, &stroked_path, true)
+                        {
+                            // Conic gradient strokes render through the expanded stroke outline.
+                        }
+                    }
+                } else if set_transform(canvas, ts) {
+                    stroke.paint.set_stroke_style(canvas, ts);
+                    stroke.attrs.apply(canvas);
+                    canvas.stroke_with_path(path);
+                }
             }
         }
     }
@@ -1171,17 +1194,17 @@ impl CanvasOp for CanvasGlyphElem {
         let _guard = CanvasStateGuard::new(canvas);
         match self.glyph_data.as_ref() {
             #[cfg(not(feature = "rasterize_glyph"))]
-            FlatGlyphItem::Outline(path) => {
-                let path = self.path.get_or_init(&path.d);
-                self.realize_outline_path(path, ts, canvas);
+            FlatGlyphItem::Outline(outline) => {
+                let path = self.path.get_or_init(&outline.d);
+                self.realize_outline_path(&outline.d, path, ts, canvas);
             }
             #[cfg(feature = "rasterize_glyph")]
-            FlatGlyphItem::Outline(path) => {
-                let path_2d = self.path.get_or_init(&path.d);
+            FlatGlyphItem::Outline(outline) => {
+                let path_2d = self.path.get_or_init(&outline.d);
 
                 let Some(solid_fill) = self.fill.as_ref().and_then(CanvasPaint::as_solid_str)
                 else {
-                    self.realize_outline_path(path_2d, ts, canvas);
+                    self.realize_outline_path(&outline.d, path_2d, ts, canvas);
                     return;
                 };
 
@@ -1191,14 +1214,14 @@ impl CanvasOp for CanvasGlyphElem {
                     || ts.kx != 0.
                     || ts.ky != 0.
                 {
-                    self.realize_outline_path(path_2d, ts, canvas);
+                    self.realize_outline_path(&outline.d, path_2d, ts, canvas);
                     return;
                 }
 
                 let x = ts.tx;
                 let y = ts.ty;
 
-                let g = crate::pixglyph_canvas::Glyph::new(&path.d);
+                let g = crate::pixglyph_canvas::Glyph::new(&outline.d);
 
                 let floor_x = x.floor() as i32;
                 let floor_y = y.floor() as i32;
