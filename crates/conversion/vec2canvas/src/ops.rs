@@ -253,6 +253,67 @@ impl CanvasOp for CanvasGroupElem {
     }
 }
 
+#[cfg(not(feature = "rasterize_glyph"))]
+#[derive(Debug, PartialEq)]
+pub(crate) struct SolidTextRunStyle<'a> {
+    pub(crate) fill: Option<&'a str>,
+    pub(crate) stroke: Option<(&'a str, &'a CanvasStrokeAttrs)>,
+}
+
+/// Stroke attributes for a canvas text run in glyph coordinate space.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanvasStrokeAttrs {
+    pub width: Scalar,
+    pub line_cap: Option<ImmutStr>,
+    pub line_join: Option<ImmutStr>,
+    pub miter_limit: Option<Scalar>,
+    pub dash_array: Option<Arc<[Scalar]>>,
+    pub dash_offset: Option<Scalar>,
+}
+
+impl CanvasStrokeAttrs {
+    pub fn apply(&self, canvas: &dyn CanvasDevice) {
+        canvas.set_line_width(self.width.0 as f64);
+        canvas.set_line_cap(self.line_cap.as_deref().unwrap_or("butt"));
+        canvas.set_line_join(self.line_join.as_deref().unwrap_or("miter"));
+        canvas.set_miter_limit(self.miter_limit.map_or(10.0, |limit| limit.0 as f64));
+        if let Some(array) = &self.dash_array {
+            let dash_array =
+                js_sys::Array::from_iter(array.iter().map(|d| JsValue::from_f64(d.0 as f64)));
+            canvas.set_line_dash(&dash_array);
+        } else {
+            canvas.set_line_dash(&js_sys::Array::new());
+        }
+        canvas.set_line_dash_offset(self.dash_offset.map_or(0.0, |offset| offset.0 as f64));
+    }
+
+    pub fn bbox_padding(&self) -> f32 {
+        let half_width = self.width.0.abs() * 0.5;
+        if !half_width.is_finite() || half_width <= 0.0 {
+            return 0.0;
+        }
+        let join_factor = match self.line_join.as_deref() {
+            Some("round" | "bevel") => 1.0,
+            _ => self
+                .miter_limit
+                .map_or(10.0, |limit| limit.0)
+                .clamp(1.0, 100.0),
+        };
+        let cap_factor = match self.line_cap.as_deref() {
+            Some("square") => std::f32::consts::SQRT_2,
+            _ => 1.0,
+        };
+        half_width * join_factor.max(cap_factor)
+    }
+}
+
+/// Paint and style attributes for stroking a glyph outline.
+#[derive(Debug, Clone)]
+pub struct CanvasStroke {
+    pub paint: CanvasPaint,
+    pub attrs: Arc<CanvasStrokeAttrs>,
+}
+
 impl CanvasGroupElem {
     #[cfg(not(feature = "rasterize_glyph"))]
     fn realize_solid_text_run(
@@ -261,12 +322,18 @@ impl CanvasGroupElem {
         canvas: &dyn CanvasDevice,
         ctx: CanvasRenderContext,
     ) -> bool {
-        let Some(fill) = self.solid_text_run_fill() else {
+        let Some(style) = self.solid_text_run_style() else {
             return false;
         };
 
         let _guard = CanvasStateGuard::new(canvas);
-        canvas.set_fill_style_str(fill);
+        if let Some(fill) = style.fill {
+            canvas.set_fill_style_str(fill);
+        }
+        if let Some((stroke_color, stroke_attrs)) = style.stroke {
+            canvas.set_stroke_style_str(stroke_color);
+            stroke_attrs.apply(canvas);
+        }
         for (pos, sub_elem) in &self.inner {
             let sub_ts = ts.pre_translate(pos.x.0, pos.y.0);
             if !ctx.render_window_intersects(sub_elem, sub_ts) {
@@ -284,15 +351,20 @@ impl CanvasGroupElem {
             }
 
             let path = glyph.path.get_or_init(&path.d);
-            canvas.fill_with_path_2d(path);
+            if style.fill.is_some() {
+                canvas.fill_with_path_2d(path);
+            }
+            if style.stroke.is_some() {
+                canvas.stroke_with_path(path);
+            }
         }
 
         true
     }
 
     #[cfg(not(feature = "rasterize_glyph"))]
-    fn solid_text_run_fill(&self) -> Option<&str> {
-        let mut fill: Option<&str> = None;
+    pub(crate) fn solid_text_run_style(&self) -> Option<SolidTextRunStyle<'_>> {
+        let mut run_style: Option<SolidTextRunStyle<'_>> = None;
         for (_, sub_elem) in &self.inner {
             let CanvasElem::Glyph(glyph) = sub_elem.as_ref() else {
                 return None;
@@ -303,17 +375,28 @@ impl CanvasGroupElem {
                 FlatGlyphItem::Image(_) => return None,
             }
 
-            let glyph_fill = glyph.fill.as_solid_str()?;
-            if let Some(fill) = fill {
-                if fill != glyph_fill {
+            let glyph_fill = match &glyph.fill {
+                Some(fill) => Some(fill.as_solid_str()?),
+                None => None,
+            };
+            let glyph_stroke = match &glyph.stroke {
+                Some(stroke) => Some((stroke.paint.as_solid_str()?, stroke.attrs.as_ref())),
+                None => None,
+            };
+            let candidate = SolidTextRunStyle {
+                fill: glyph_fill,
+                stroke: glyph_stroke,
+            };
+            if let Some(existing) = &run_style {
+                if existing != &candidate {
                     return None;
                 }
             } else {
-                fill = Some(glyph_fill);
+                run_style = Some(candidate);
             }
         }
 
-        fill
+        run_style.filter(|style| style.fill.is_some() || style.stroke.is_some())
     }
 
     async fn realize_inner(
@@ -1027,11 +1110,35 @@ impl CanvasOp for CanvasImageElem {
 /// A glyph element.
 #[derive(Debug)]
 pub struct CanvasGlyphElem {
-    pub fill: CanvasPaint,
+    pub fill: Option<CanvasPaint>,
+    pub stroke: Option<CanvasStroke>,
     pub upem: Scalar,
     pub glyph_data: Arc<FlatGlyphItem>,
     pub path: CachedPath2d,
     pub bbox: OnceCell<Option<Rect>>,
+}
+
+impl CanvasGlyphElem {
+    fn realize_outline_path(&self, path: &Path2d, ts: sk::Transform, canvas: &dyn CanvasDevice) {
+        if let Some(fill) = &self.fill {
+            if !fill.is_unsupported() {
+                if fill.fill_conic_path(canvas, ts, path, false) {
+                    // Conic gradient fills manage their own clipped paint state.
+                } else if set_transform(canvas, ts) {
+                    fill.set_fill_style(canvas, ts);
+                    canvas.fill_with_path_2d(path);
+                }
+            }
+        }
+
+        if let Some(stroke) = &self.stroke {
+            if !stroke.paint.is_unsupported() && set_transform(canvas, ts) {
+                stroke.paint.set_stroke_style(canvas, ts);
+                stroke.attrs.apply(canvas);
+                canvas.stroke_with_path(path);
+            }
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -1065,47 +1172,26 @@ impl CanvasOp for CanvasGlyphElem {
         match self.glyph_data.as_ref() {
             #[cfg(not(feature = "rasterize_glyph"))]
             FlatGlyphItem::Outline(path) => {
-                if self.fill.is_unsupported() {
-                    return;
-                }
-
                 let path = self.path.get_or_init(&path.d);
-                if self.fill.fill_conic_path(canvas, ts, path, false) {
-                    return;
-                }
-
-                if !set_transform(canvas, ts) {
-                    return;
-                }
-                self.fill.set_fill_style(canvas, ts);
-                canvas.fill_with_path_2d(path);
+                self.realize_outline_path(path, ts, canvas);
             }
             #[cfg(feature = "rasterize_glyph")]
             FlatGlyphItem::Outline(path) => {
-                if self.fill.is_unsupported() {
-                    return;
-                }
-
                 let path_2d = self.path.get_or_init(&path.d);
-                if self.fill.fill_conic_path(canvas, ts, &path_2d, false) {
-                    return;
-                }
 
-                if self.fill.as_solid_str().is_none() {
-                    if !set_transform(canvas, ts) {
-                        return;
-                    }
-                    self.fill.set_fill_style(canvas, ts);
-                    canvas.fill_with_path_2d(&path_2d);
+                let Some(solid_fill) = self.fill.as_ref().and_then(CanvasPaint::as_solid_str)
+                else {
+                    self.realize_outline_path(path_2d, ts, canvas);
                     return;
-                }
+                };
 
-                if ts.sx.abs() > 100. || ts.sy.abs() > 100. || ts.kx != 0. || ts.ky != 0. {
-                    if !set_transform(canvas, ts) {
-                        return;
-                    }
-                    self.fill.set_fill_style(canvas, ts);
-                    canvas.fill_with_path_2d(&path_2d);
+                if self.stroke.is_some()
+                    || ts.sx.abs() > 100.
+                    || ts.sy.abs() > 100.
+                    || ts.kx != 0.
+                    || ts.ky != 0.
+                {
+                    self.realize_outline_path(path_2d, ts, canvas);
                     return;
                 }
 
@@ -1121,13 +1207,7 @@ impl CanvasOp for CanvasGlyphElem {
 
                 let t = g.rasterize(dx, dy, ts.sx, ts.sy);
 
-                crate::pixglyph_canvas::blend_glyph(
-                    canvas,
-                    &t,
-                    self.fill.as_solid_str().unwrap(),
-                    floor_x,
-                    floor_y,
-                );
+                crate::pixglyph_canvas::blend_glyph(canvas, &t, solid_fill, floor_x, floor_y);
             }
             FlatGlyphItem::Image(glyph) => {
                 if !set_transform(canvas, ts) {

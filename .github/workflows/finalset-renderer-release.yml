@@ -1,0 +1,54 @@
+name: Finalset Renderer WASM Release
+
+on:
+  push:
+    tags:
+      - 'v*-finalset.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional existing tag to attach the built tarball to
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-renderer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.92.0
+          components: clippy, rustfmt
+          target: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | bash
+      - name: Run reflexo-vec2canvas tests
+        run: cargo test -p reflexo-vec2canvas
+      - name: Build and pack @myriaddreamin/typst-ts-renderer
+        run: bash scripts/build-finalset-renderer.sh
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: typst-ts-renderer-tarball
+          path: packages/renderer/*.tgz
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+        run: |
+          TARBALL="$(ls packages/renderer/*.tgz | head -n 1)"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${TARBALL}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${TARBALL}" \
+              --title "${RELEASE_TAG}" \
+              --notes "Finalset fork build of \`@myriaddreamin/typst-ts-renderer\` with native \`reflexo-vec2canvas\` \`TextItem\` stroke rendering."
+          fi

@@ -206,9 +206,21 @@ impl BBoxAt for CanvasImageElem {
 
 impl BBoxAt for CanvasGlyphElem {
     fn bbox_at(&self, ts: sk::Transform) -> Option<Rect> {
-        let rect = self
-            .bbox
-            .get_or_init(|| glyph_local_bbox(self.glyph_data.as_ref()));
+        let rect = self.bbox.get_or_init(|| {
+            let rect = glyph_local_bbox(self.glyph_data.as_ref())?.cano();
+            let pad = self
+                .stroke
+                .as_ref()
+                .map_or(0.0, |stroke| stroke.attrs.bbox_padding());
+            if pad > 0.0 {
+                Some(Rect {
+                    lo: ir::Point::new(Scalar(rect.lo.x.0 - pad), Scalar(rect.lo.y.0 - pad)),
+                    hi: ir::Point::new(Scalar(rect.hi.x.0 + pad), Scalar(rect.hi.y.0 + pad)),
+                })
+            } else {
+                Some(rect)
+            }
+        });
         transform_rect((*rect)?, ts)
     }
 }

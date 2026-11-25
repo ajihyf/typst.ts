@@ -1,12 +1,12 @@
 {
   "name": "@myriaddreamin/typst-ts-renderer",
-  "version": "0.8.0-rc4",
-  "description": "WASM module for rendering Typst documents in browser.",
+  "version": "0.8.0-rc4-finalset.1",
+  "description": "WASM module for rendering Typst documents in browser (Finalset fork with text stroke canvas support).",
   "author": "Myriad-Dreamin",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Myriad-Dreamin/typst.ts"
+    "url": "https://github.com/ajihyf/typst.ts"
   },
   "keywords": [
     "TypeScript",

@@ -152,7 +152,13 @@ impl<Feat: ExportFeature> CanvasTask<Feat> {
 }
 
 trait GlyphFactory {
-    fn get_glyph(&mut self, font: &FontItem, glyph: u32, fill: CanvasPaint) -> Option<CanvasNode>;
+    fn get_glyph(
+        &mut self,
+        font: &FontItem,
+        glyph: u32,
+        fill: Option<CanvasPaint>,
+        stroke: Option<CanvasStroke>,
+    ) -> Option<CanvasNode>;
     fn get_paint(&self, fill: &ImmutStr) -> CanvasPaint;
 }
 
@@ -176,7 +182,8 @@ pub struct CanvasRenderTask<'m, 't, Feat: ExportFeature> {
 struct CanvasGlyphCacheKey {
     font: Fingerprint,
     glyph: u32,
-    fill: ImmutStr,
+    fill: Option<ImmutStr>,
+    stroke: Option<(ImmutStr, Arc<CanvasStrokeAttrs>)>,
 }
 
 impl<'m, Feat: ExportFeature> FontIndice<'m> for CanvasRenderTask<'m, '_, Feat> {
@@ -186,12 +193,33 @@ impl<'m, Feat: ExportFeature> FontIndice<'m> for CanvasRenderTask<'m, '_, Feat> 
 }
 
 impl<Feat: ExportFeature> GlyphFactory for CanvasRenderTask<'_, '_, Feat> {
-    fn get_glyph(&mut self, font: &FontItem, glyph: u32, fill: CanvasPaint) -> Option<CanvasNode> {
-        if let CanvasPaint::Solid(fill_color) = fill {
+    fn get_glyph(
+        &mut self,
+        font: &FontItem,
+        glyph: u32,
+        fill: Option<CanvasPaint>,
+        stroke: Option<CanvasStroke>,
+    ) -> Option<CanvasNode> {
+        let cacheable_fill = match &fill {
+            None => Some(None),
+            Some(CanvasPaint::Solid(color)) => Some(Some(color.clone())),
+            Some(CanvasPaint::Gradient(_) | CanvasPaint::Unsupported) => None,
+        };
+        let cacheable_stroke = match &stroke {
+            None => Some(None),
+            Some(CanvasStroke {
+                paint: CanvasPaint::Solid(color),
+                attrs,
+            }) => Some(Some((color.clone(), attrs.clone()))),
+            Some(_) => None,
+        };
+
+        if let (Some(fill_key), Some(stroke_key)) = (cacheable_fill, cacheable_stroke) {
             let key = CanvasGlyphCacheKey {
                 font: font.fingerprint,
                 glyph,
-                fill: fill_color.clone(),
+                fill: fill_key,
+                stroke: stroke_key,
             };
             if let Some(cached) = self.glyph_cache.get(&key) {
                 return Some(cached.clone());
@@ -199,7 +227,8 @@ impl<Feat: ExportFeature> GlyphFactory for CanvasRenderTask<'_, '_, Feat> {
 
             let glyph_data = font.get_glyph(glyph)?;
             let node = Arc::new(CanvasElem::Glyph(CanvasGlyphElem {
-                fill: CanvasPaint::Solid(fill_color),
+                fill,
+                stroke,
                 upem: font.units_per_em,
                 glyph_data: glyph_data.clone(),
                 path: Default::default(),
@@ -212,6 +241,7 @@ impl<Feat: ExportFeature> GlyphFactory for CanvasRenderTask<'_, '_, Feat> {
         let glyph_data = font.get_glyph(glyph)?;
         Some(Arc::new(CanvasElem::Glyph(CanvasGlyphElem {
             fill,
+            stroke,
             upem: font.units_per_em,
             glyph_data: glyph_data.clone(),
             path: Default::default(),
@@ -239,6 +269,7 @@ impl<'m, Feat: ExportFeature> RenderVm<'m> for CanvasRenderTask<'m, '_, Feat> {
             ts: sk::Transform::identity(),
             clipper: None,
             fill: None,
+            stroke: None,
             glyph_scale: None,
             inner: EcoVec::new(),
             rect: CanvasBBox::Dynamic(Box::new(OnceCell::new())),
@@ -250,6 +281,89 @@ impl<'m, Feat: ExportFeature> RenderVm<'m> for CanvasRenderTask<'m, '_, Feat> {
         g.kind = GroupKind::Text;
         let font = self.get_font(&text.shape.font).unwrap();
         let upem = Scalar(font.units_per_em.0);
+        let mut stroke_paint = None;
+        let mut stroke_width_pt = 0.0_f32;
+        let mut stroke_line_cap = None;
+        let mut stroke_line_join = None;
+        let mut stroke_miter_limit = None;
+        let mut stroke_dash_array: Option<Arc<[Scalar]>> = None;
+        let mut stroke_dash_offset: Option<Scalar> = None;
+
+        for style in &text.shape.styles {
+            match style {
+                ir::PathStyle::Fill(fill) => {
+                    g.fill = Some(fill.clone());
+                }
+                ir::PathStyle::Stroke(stroke) => {
+                    stroke_paint = Some(stroke.clone());
+                }
+                ir::PathStyle::StrokeWidth(width) => {
+                    stroke_width_pt = width.0;
+                }
+                ir::PathStyle::StrokeLineCap(cap) => {
+                    stroke_line_cap = Some(cap.clone());
+                }
+                ir::PathStyle::StrokeLineJoin(join) => {
+                    stroke_line_join = Some(join.clone());
+                }
+                ir::PathStyle::StrokeMitterLimit(limit) => {
+                    stroke_miter_limit = Some(*limit);
+                }
+                ir::PathStyle::StrokeDashArray(array) => {
+                    stroke_dash_array = Some(array.clone());
+                }
+                ir::PathStyle::StrokeDashOffset(offset) => {
+                    stroke_dash_offset = Some(*offset);
+                }
+                ir::PathStyle::FillRule(_) => {}
+            }
+        }
+
+        let inv_ppem = if text.shape.size.0 > 0.0 && upem.0 > 0.0 {
+            let scale = upem.0 / text.shape.size.0;
+            scale.is_finite().then_some(scale)
+        } else {
+            None
+        };
+        if let (Some(paint), Some(inv_ppem)) = (stroke_paint, inv_ppem) {
+            if stroke_width_pt.is_finite() && stroke_width_pt > 1e-5 {
+                let scaled_width = stroke_width_pt * inv_ppem;
+                if scaled_width.is_finite() && scaled_width > 0.0 {
+                    let dash_array = stroke_dash_array.and_then(|arr| {
+                        let scaled: Option<Vec<Scalar>> = arr
+                            .iter()
+                            .map(|d| {
+                                let v = d.0 * inv_ppem;
+                                (v.is_finite() && v >= 0.0).then_some(Scalar(v))
+                            })
+                            .collect();
+                        scaled.map(Arc::from)
+                    });
+                    let dash_offset = stroke_dash_offset.and_then(|offset| {
+                        let v = offset.0 * inv_ppem;
+                        v.is_finite().then_some(Scalar(v))
+                    });
+                    let miter_limit =
+                        stroke_miter_limit.filter(|limit| limit.0.is_finite() && limit.0 > 0.0);
+                    g.stroke = Some((
+                        paint,
+                        Arc::new(CanvasStrokeAttrs {
+                            width: Scalar(scaled_width),
+                            line_cap: stroke_line_cap,
+                            line_join: stroke_line_join,
+                            miter_limit,
+                            dash_array,
+                            dash_offset,
+                        }),
+                    ));
+                }
+            }
+        }
+
+        let stroke_pad = g
+            .stroke
+            .as_ref()
+            .map_or(0.0, |(_, attrs)| attrs.bbox_padding());
         g.rect = {
             // upem is the unit per em defined in the font.
             let accender = Scalar(font.ascender.0) * upem;
@@ -257,23 +371,34 @@ impl<'m, Feat: ExportFeature> RenderVm<'m> for CanvasRenderTask<'m, '_, Feat> {
             // todo: glyphs like macron has zero width... why?
             let w = text.width();
 
-            if text.shape.size.0 == 0. {
-                CanvasBBox::Static(Box::new(Rect {
+            let base_rect = if text.shape.size.0 == 0. {
+                Rect {
                     lo: Point::new(Scalar(0.), accender - upem),
                     hi: Point::new(Scalar(0.), accender),
-                }))
+                }
             } else {
-                CanvasBBox::Static(Box::new(Rect {
+                Rect {
                     lo: Point::new(Scalar(0.), accender - upem),
                     hi: Point::new(w * upem / text.shape.size, accender),
-                }))
+                }
             }
+            .cano();
+            let rect = if stroke_pad > 0.0 {
+                Rect {
+                    lo: Point::new(
+                        Scalar(base_rect.lo.x.0 - stroke_pad),
+                        Scalar(base_rect.lo.y.0 - stroke_pad),
+                    ),
+                    hi: Point::new(
+                        Scalar(base_rect.hi.x.0 + stroke_pad),
+                        Scalar(base_rect.hi.y.0 + stroke_pad),
+                    ),
+                }
+            } else {
+                base_rect
+            };
+            CanvasBBox::Static(Box::new(rect))
         };
-        for style in &text.shape.styles {
-            if let ir::PathStyle::Fill(fill) = style {
-                g.fill = Some(fill.clone());
-            }
-        }
         g.glyph_scale = Some(Scalar(text.shape.size.0 / upem.0));
         g
     }
@@ -291,6 +416,8 @@ pub struct CanvasStack {
     pub clipper: Option<ir::PathItem>,
     /// The fill color.
     pub fill: Option<ImmutStr>,
+    /// The text stroke paint and glyph-space attributes.
+    pub stroke: Option<(ImmutStr, Arc<CanvasStrokeAttrs>)>,
     /// The font-size to font-unit scale for text glyphs.
     pub glyph_scale: Option<Scalar>,
     /// The inner elements.
@@ -397,12 +524,23 @@ impl<'m, C: RenderVm<'m, Resultant = CanvasNode> + GlyphFactory> GroupContext<C>
     }
 
     fn render_glyph(&mut self, ctx: &mut C, pos: Axes<Scalar>, font: &FontItem, glyph: u32) {
-        let mut fill = ctx.get_paint(&self.fill.clone().unwrap());
-        if let Some(glyph_scale) = self.glyph_scale {
-            fill = fill.for_glyph(pos, glyph_scale, font, glyph);
+        let mut fill = self.fill.as_ref().map(|fill| ctx.get_paint(fill));
+        if let (Some(fill), Some(glyph_scale)) = (fill.as_mut(), self.glyph_scale) {
+            *fill = fill.for_glyph(pos, glyph_scale, font, glyph);
         }
 
-        if let Some(glyph) = ctx.get_glyph(font, glyph, fill) {
+        let stroke = self.stroke.as_ref().map(|(paint, attrs)| {
+            let mut stroke_paint = ctx.get_paint(paint);
+            if let Some(glyph_scale) = self.glyph_scale {
+                stroke_paint = stroke_paint.for_glyph(pos, glyph_scale, font, glyph);
+            }
+            CanvasStroke {
+                paint: stroke_paint,
+                attrs: attrs.clone(),
+            }
+        });
+
+        if let Some(glyph) = ctx.get_glyph(font, glyph, fill, stroke) {
             self.inner.push((ir::Point::new(pos.x, pos.y), glyph));
         }
     }
@@ -602,4 +740,348 @@ pub async fn exception_create_image_blob(blob: &Blob, image_elem: &HtmlImageElem
 #[comemo::memoize]
 fn rasterize_image(e: Arc<Image>) -> Option<UnsafeMemorize<LazyImage>> {
     create_image(e).map(UnsafeMemorize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reflexo::vector::ir::{
+        FlatGlyphItem, GradientItem, GradientKind, ItemMap, OutlineGlyphItem, PathStyle, Rgba8Item,
+        TextItem, TextItemContent, TextShape, VecItem,
+    };
+
+    fn test_font() -> FontItem {
+        let outline = Arc::new(FlatGlyphItem::Outline(Arc::new(OutlineGlyphItem {
+            ts: None,
+            d: "M 0 0 L 500 0 L 500 700 L 0 700 Z".into(),
+            ligature_len: 1,
+        })));
+        FontItem {
+            fingerprint: Fingerprint::from_u128(0x1234),
+            family: "TestSong".into(),
+            hash: 1,
+            cap_height: Scalar(0.7),
+            ascender: Scalar(0.88),
+            descender: Scalar(-0.12),
+            units_per_em: Scalar(1000.0),
+            vertical: false,
+            glyphs: vec![outline],
+            glyph_cov: Default::default(),
+        }
+    }
+
+    fn make_text_item(size: f32, styles: Vec<PathStyle>) -> VecItem {
+        VecItem::Text(TextItem {
+            content: Arc::new(TextItemContent {
+                content: "A".into(),
+                glyphs: Arc::from([(
+                    Axes::new(Scalar(0.0), Scalar(0.0)),
+                    Axes::new(Scalar(size), Scalar(0.0)),
+                    0u32,
+                )]),
+            }),
+            shape: Arc::new(TextShape {
+                font: FontRef { hash: 1, idx: 0 },
+                dir: "ltr".into(),
+                size: Scalar(size),
+                styles,
+            }),
+        })
+    }
+
+    fn extract_single_glyph(node: &CanvasNode) -> (&CanvasGroupElem, &CanvasGlyphElem) {
+        let CanvasElem::Group(group) = node.as_ref() else {
+            panic!("expected CanvasElem::Group");
+        };
+        let CanvasElem::Glyph(glyph) = group.inner[0].1.as_ref() else {
+            panic!("expected CanvasElem::Glyph");
+        };
+        (group, glyph)
+    }
+
+    #[test]
+    fn text_stroke_scales_lengths_keeps_miter_limit_and_uses_solid_fast_path() {
+        let fg = Fingerprint::from_u128(1);
+        let mut items = ItemMap::default();
+        items.insert(
+            fg,
+            make_text_item(
+                10.0,
+                vec![
+                    PathStyle::Fill("#111111".into()),
+                    PathStyle::Stroke("#e60012".into()),
+                    PathStyle::StrokeWidth(Scalar(0.3)),
+                    PathStyle::StrokeLineCap("round".into()),
+                    PathStyle::StrokeLineJoin("bevel".into()),
+                    PathStyle::StrokeMitterLimit(Scalar(4.0)),
+                    PathStyle::StrokeDashArray(Arc::from([Scalar(1.5), Scalar(0.5)])),
+                    PathStyle::StrokeDashOffset(Scalar(0.25)),
+                ],
+            ),
+        );
+        let module = Module {
+            fonts: vec![test_font()],
+            glyphs: vec![],
+            items,
+        };
+
+        let mut task = CanvasTask::<DefaultExportFeature>::default();
+        let mut render = task.fork_canvas_render_task(&module);
+        let node = render.render_item(&fg);
+        let (group, glyph) = extract_single_glyph(&node);
+
+        assert_eq!(
+            glyph.fill.as_ref().and_then(CanvasPaint::as_solid_str),
+            Some("#111111")
+        );
+        let stroke = glyph.stroke.as_ref().expect("glyph stroke must be present");
+        assert_eq!(stroke.paint.as_solid_str(), Some("#e60012"));
+        // inv_ppem = 1000 / 10 = 100
+        assert!((stroke.attrs.width.0 - 30.0).abs() < 1e-4);
+        assert_eq!(stroke.attrs.line_cap.as_deref(), Some("round"));
+        assert_eq!(stroke.attrs.line_join.as_deref(), Some("bevel"));
+        // miter_limit is a dimensionless ratio and must NOT be scaled by inv_ppem.
+        assert_eq!(stroke.attrs.miter_limit, Some(Scalar(4.0)));
+        assert_eq!(
+            stroke.attrs.dash_array.as_deref(),
+            Some(&[Scalar(150.0), Scalar(50.0)][..])
+        );
+        assert_eq!(stroke.attrs.dash_offset, Some(Scalar(25.0)));
+
+        #[cfg(not(feature = "rasterize_glyph"))]
+        {
+            let run_style = group
+                .solid_text_run_style()
+                .expect("solid fill + solid stroke must use batched text run fast path");
+            assert_eq!(run_style.fill, Some("#111111"));
+            assert_eq!(run_style.stroke, Some(("#e60012", stroke.attrs.as_ref())));
+        }
+
+        // BBox expands by half-width (bevel join => factor 1.0 => 15 upem => 0.15pt).
+        let glyph_bbox = glyph
+            .bbox_at(sk::Transform::identity())
+            .expect("glyph bbox");
+        assert!((glyph_bbox.lo.x.0 - (-15.0)).abs() < 1e-3);
+        assert!((glyph_bbox.hi.x.0 - 515.0).abs() < 1e-3);
+        assert!((glyph_bbox.lo.y.0 - (-15.0)).abs() < 1e-3);
+        assert!((glyph_bbox.hi.y.0 - 715.0).abs() < 1e-3);
+
+        let group_bbox = group
+            .bbox_at(sk::Transform::identity())
+            .expect("group bbox");
+        assert!(group_bbox.lo.x.0 < -0.1);
+        assert!(group_bbox.hi.x.0 > 10.1);
+    }
+
+    #[test]
+    fn glyph_cache_isolates_unstroked_and_differently_stroked_glyphs() {
+        let fg_plain = Fingerprint::from_u128(10);
+        let fg_bold = Fingerprint::from_u128(11);
+        let fg_thicker = Fingerprint::from_u128(12);
+        let fg_bold_same = Fingerprint::from_u128(13);
+
+        let mut items = ItemMap::default();
+        items.insert(
+            fg_plain,
+            make_text_item(12.0, vec![PathStyle::Fill("#000000".into())]),
+        );
+        items.insert(
+            fg_bold,
+            make_text_item(
+                12.0,
+                vec![
+                    PathStyle::Fill("#000000".into()),
+                    PathStyle::Stroke("#000000".into()),
+                    PathStyle::StrokeWidth(Scalar(0.34284)),
+                    PathStyle::StrokeMitterLimit(Scalar(4.0)),
+                ],
+            ),
+        );
+        items.insert(
+            fg_thicker,
+            make_text_item(
+                12.0,
+                vec![
+                    PathStyle::Fill("#000000".into()),
+                    PathStyle::Stroke("#000000".into()),
+                    PathStyle::StrokeWidth(Scalar(0.6)),
+                    PathStyle::StrokeMitterLimit(Scalar(4.0)),
+                ],
+            ),
+        );
+        items.insert(
+            fg_bold_same,
+            make_text_item(
+                12.0,
+                vec![
+                    PathStyle::Fill("#000000".into()),
+                    PathStyle::Stroke("#000000".into()),
+                    PathStyle::StrokeWidth(Scalar(0.34284)),
+                    PathStyle::StrokeMitterLimit(Scalar(4.0)),
+                ],
+            ),
+        );
+        let module = Module {
+            fonts: vec![test_font()],
+            glyphs: vec![],
+            items,
+        };
+
+        let mut task = CanvasTask::<DefaultExportFeature>::default();
+        let mut render = task.fork_canvas_render_task(&module);
+
+        let plain_node = render.render_item(&fg_plain);
+        let bold_node = render.render_item(&fg_bold);
+        let thicker_node = render.render_item(&fg_thicker);
+        let bold_same_node = render.render_item(&fg_bold_same);
+
+        let (_, plain_glyph) = extract_single_glyph(&plain_node);
+        let (bold_group, bold_glyph) = extract_single_glyph(&bold_node);
+        let (_, thicker_glyph) = extract_single_glyph(&thicker_node);
+        let (bold_same_group, _) = extract_single_glyph(&bold_same_node);
+
+        assert!(plain_glyph.stroke.is_none());
+        assert!(bold_glyph.stroke.is_some());
+        assert!(thicker_glyph.stroke.is_some());
+        assert_ne!(
+            bold_glyph.stroke.as_ref().unwrap().attrs.width,
+            thicker_glyph.stroke.as_ref().unwrap().attrs.width
+        );
+        // Identical font + glyph + fill + stroke hits glyph_cache and shares Arc.
+        assert!(Arc::ptr_eq(
+            &bold_group.inner[0].1,
+            &bold_same_group.inner[0].1
+        ));
+    }
+
+    #[test]
+    fn handles_zero_width_zero_size_stroke_only_and_gradient_stroke() {
+        let fg_zero_width = Fingerprint::from_u128(20);
+        let fg_zero_size = Fingerprint::from_u128(21);
+        let fg_stroke_only = Fingerprint::from_u128(22);
+        let fg_grad = Fingerprint::from_u128(23);
+        let fg_grad_text = Fingerprint::from_u128(24);
+
+        let mut items = ItemMap::default();
+        items.insert(
+            fg_zero_width,
+            make_text_item(
+                12.0,
+                vec![
+                    PathStyle::Fill("#000000".into()),
+                    PathStyle::Stroke("#ff0000".into()),
+                    PathStyle::StrokeWidth(Scalar(0.0)),
+                ],
+            ),
+        );
+        items.insert(
+            fg_zero_size,
+            make_text_item(
+                0.0,
+                vec![
+                    PathStyle::Fill("#000000".into()),
+                    PathStyle::Stroke("#ff0000".into()),
+                    PathStyle::StrokeWidth(Scalar(0.5)),
+                ],
+            ),
+        );
+        items.insert(
+            fg_stroke_only,
+            make_text_item(
+                10.0,
+                vec![
+                    PathStyle::Stroke("#0044ff".into()),
+                    PathStyle::StrokeWidth(Scalar(0.2)),
+                ],
+            ),
+        );
+        items.insert(
+            fg_grad,
+            VecItem::Gradient(Arc::new(GradientItem {
+                stops: vec![
+                    (
+                        Rgba8Item {
+                            r: 255,
+                            g: 0,
+                            b: 0,
+                            a: 255,
+                        },
+                        Scalar(0.0),
+                    ),
+                    (
+                        Rgba8Item {
+                            r: 0,
+                            g: 0,
+                            b: 255,
+                            a: 255,
+                        },
+                        Scalar(1.0),
+                    ),
+                ],
+                space: reflexo::vector::ir::ColorSpace::Srgb,
+                anti_alias: true,
+                kind: GradientKind::Linear(Scalar(0.0)),
+                styles: vec![],
+            })),
+        );
+        let grad_ref: ImmutStr = format!("@{}", fg_grad.as_svg_id("g")).into();
+        items.insert(
+            fg_grad_text,
+            make_text_item(
+                10.0,
+                vec![
+                    PathStyle::Fill("#000000".into()),
+                    PathStyle::Stroke(grad_ref),
+                    PathStyle::StrokeWidth(Scalar(0.2)),
+                ],
+            ),
+        );
+
+        let module = Module {
+            fonts: vec![test_font()],
+            glyphs: vec![],
+            items,
+        };
+        let mut task = CanvasTask::<DefaultExportFeature>::default();
+        let mut render = task.fork_canvas_render_task(&module);
+
+        let zero_width_node = render.render_item(&fg_zero_width);
+        let (_, g_zero_width) = extract_single_glyph(&zero_width_node);
+        assert!(g_zero_width.stroke.is_none());
+
+        let zero_size_node = render.render_item(&fg_zero_size);
+        let (_, g_zero_size) = extract_single_glyph(&zero_size_node);
+        assert!(g_zero_size.stroke.is_none());
+
+        let stroke_only_node = render.render_item(&fg_stroke_only);
+        let (_stroke_only_group, g_stroke_only) = extract_single_glyph(&stroke_only_node);
+        assert!(g_stroke_only.fill.is_none());
+        assert_eq!(
+            g_stroke_only
+                .stroke
+                .as_ref()
+                .and_then(|s| s.paint.as_solid_str()),
+            Some("#0044ff")
+        );
+        #[cfg(not(feature = "rasterize_glyph"))]
+        {
+            let style = _stroke_only_group
+                .solid_text_run_style()
+                .expect("stroke-only solid text should use batched path");
+            assert!(style.fill.is_none());
+            assert_eq!(style.stroke.map(|(c, _)| c), Some("#0044ff"));
+        }
+
+        let grad_node = render.render_item(&fg_grad_text);
+        let (_grad_group, g_grad) = extract_single_glyph(&grad_node);
+        assert!(matches!(
+            g_grad.stroke.as_ref().map(|s| &s.paint),
+            Some(CanvasPaint::Gradient(_))
+        ));
+        #[cfg(not(feature = "rasterize_glyph"))]
+        assert!(
+            _grad_group.solid_text_run_style().is_none(),
+            "gradient stroke must fall back to per-glyph CanvasGlyphElem::realize"
+        );
+    }
 }
