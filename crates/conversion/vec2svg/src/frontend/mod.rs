@@ -141,6 +141,7 @@ impl<Feat: ExportFeature> SvgExporter<Feat> {
                             GradientStyle::FocalRadius(r) => {
                                 focal_radius = r;
                             }
+                            GradientStyle::AspectRatio(_) => {}
                         }
                     }
 
@@ -160,16 +161,25 @@ impl<Feat: ExportFeature> SvgExporter<Feat> {
                         )
                     ));
 
+                    let mut style_aspect_ratio = None;
+                    let mut center = &Axes::new(Scalar(0.5), Scalar(0.5));
+                    for s in &gradient.styles {
+                        match s {
+                            GradientStyle::Center(c) => {
+                                center = c;
+                            }
+                            GradientStyle::AspectRatio(r) if r.0.is_finite() && r.0 > 0.0 => {
+                                style_aspect_ratio = Some(r.0);
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // Match typst-svg: the later pattern transform scales the
                     // unit pattern to the paint size, so each segment boundary
                     // is corrected with the inverse paint aspect ratio.
-                    let inverse_ratio = 1.0 / gradient_aspect_ratio(aspect_ratio);
-                    let mut center = &Axes::new(Scalar(0.5), Scalar(0.5));
-                    for s in &gradient.styles {
-                        if let GradientStyle::Center(c) = s {
-                            center = c;
-                        }
-                    }
+                    let inverse_ratio =
+                        1.0 / gradient_aspect_ratio(style_aspect_ratio.or(aspect_ratio));
 
                     // We build an arg segment for each segment of a circle.
                     let dtheta = TAU / CONIC_SEGMENT as f32;

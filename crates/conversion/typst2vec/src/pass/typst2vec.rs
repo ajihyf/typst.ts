@@ -1016,6 +1016,15 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         ir::Transform::from_translate(offset.x.into_typst(), offset.y.into_typst()),
                     )
                 },
+                || {
+                    let size = shape.bbox(include_stroke_in_bbox).size();
+                    let x = size.x.to_f32().abs();
+                    let y = size.y.to_f32().abs();
+                    let x = if x == 0.0 { 1.0 } else { x };
+                    let y = if y == 0.0 { 1.0 } else { y };
+                    let ratio = x / y;
+                    ratio.is_finite().then_some(ratio)
+                },
                 false,
                 is_gradient,
             )
@@ -1034,6 +1043,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                     let text_scale = upem / text_size;
                     ir::Transform::from_scale(ir::Scalar(text_scale), ir::Scalar(-text_scale))
                 },
+                || None,
                 true,
                 is_gradient,
             )
@@ -1045,16 +1055,18 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         &self,
         state: State,
         g: &Paint,
-        mk_transform: impl FnOnce(Smart<RelativeTo>, bool) -> Transform,
+        mk_transform: impl FnOnce(Smart<RelativeTo>, bool) -> (Transform, Option<f32>),
     ) -> ImmutStr {
         match g {
             Paint::Solid(c) => c.clone().to_css().into(),
             Paint::Tiling(e) => {
-                let fingerprint = self.pattern(state, e, mk_transform(e.relative(), false));
+                let (transform, _) = mk_transform(e.relative(), false);
+                let fingerprint = self.pattern(state, e, transform);
                 format!("@{}", fingerprint.as_svg_id("p")).into()
             }
             Paint::Gradient(g) => {
-                let fingerprint = self.gradient(g, mk_transform(g.relative(), true));
+                let (transform, aspect_ratio) = mk_transform(g.relative(), true);
+                let fingerprint = self.gradient(g, transform, aspect_ratio);
                 format!("@{}", fingerprint.as_svg_id("g")).into()
             }
         }
@@ -1066,31 +1078,47 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         state: State,
         relative_to_self: Smart<RelativeTo>,
         scale_ts: impl FnOnce() -> ir::Transform,
+        self_aspect_ratio: impl FnOnce() -> Option<f32>,
         is_text: bool,
         is_gradient: bool,
-    ) -> ir::Transform {
+    ) -> (ir::Transform, Option<f32>) {
         let relative_to_self = match relative_to_self {
             Smart::Auto => !is_text,
             Smart::Custom(t) => t == RelativeTo::Self_,
         };
+        let parent_aspect_ratio = || {
+            let w = state.size.x.0.abs();
+            let h = state.size.y.0.abs();
+            if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 {
+                let ratio = w / h;
+                ratio.is_finite().then_some(ratio)
+            } else {
+                None
+            }
+        };
 
         if is_text {
             return match (is_gradient, relative_to_self) {
-                (_, true) => ir::Transform::identity(),
-                (true, false) => state.body_inv_transform(),
-                (false, false) => state.inv_transform(),
+                (_, true) => (ir::Transform::identity(), None),
+                (true, false) => (state.body_inv_transform(), parent_aspect_ratio()),
+                (false, false) => (state.inv_transform(), None),
             };
         }
 
         match (is_gradient, relative_to_self) {
-            (true, true) => scale_ts(),
-            (false, true) => ir::Transform::identity(),
-            (true, false) => state.body_inv_transform(),
-            (false, false) => state.inv_transform(),
+            (true, true) => (scale_ts(), self_aspect_ratio()),
+            (false, true) => (ir::Transform::identity(), None),
+            (true, false) => (state.body_inv_transform(), parent_aspect_ratio()),
+            (false, false) => (state.inv_transform(), None),
         }
     }
 
-    fn gradient(&self, g: &Gradient, transform: ir::Transform) -> Fingerprint {
+    fn gradient(
+        &self,
+        g: &Gradient,
+        transform: ir::Transform,
+        aspect_ratio: Option<f32>,
+    ) -> Fingerprint {
         let mut stops = Vec::with_capacity(g.stops_ref().len());
         for (c, step) in g.stops_ref() {
             let (r, g, b, a) = c.to_rgb().into_format::<u8, u8>().into_components();
@@ -1102,7 +1130,12 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
 
         let mut styles = Vec::new();
         let kind = match g {
-            Gradient::Linear(l) => GradientKind::Linear(l.angle.into_typst()),
+            Gradient::Linear(l) => {
+                if let Some(ratio) = aspect_ratio.filter(|r| r.is_finite() && *r > 0.0) {
+                    styles.push(GradientStyle::AspectRatio(Scalar(ratio)));
+                }
+                GradientKind::Linear(l.angle.into_typst())
+            }
             Gradient::Radial(l) => {
                 if l.center.x != TypstRatio::new(0.5) || l.center.y != TypstRatio::new(0.5) {
                     styles.push(GradientStyle::Center(l.center.into_typst()));
@@ -1123,6 +1156,9 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             Gradient::Conic(l) => {
                 if l.center.x != TypstRatio::new(0.5) || l.center.y != TypstRatio::new(0.5) {
                     styles.push(GradientStyle::Center(l.center.into_typst()));
+                }
+                if let Some(ratio) = aspect_ratio.filter(|r| r.is_finite() && *r > 0.0) {
+                    styles.push(GradientStyle::AspectRatio(Scalar(ratio)));
                 }
 
                 GradientKind::Conic(l.angle.into_typst())

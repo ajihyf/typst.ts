@@ -132,6 +132,8 @@ pub enum GradientStyle {
     FocalCenter(Point),
     /// Focal radius of a radial gradient.
     FocalRadius(Scalar),
+    /// Untransformed `width / height` aspect ratio of the gradient's reference box.
+    AspectRatio(Scalar),
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]

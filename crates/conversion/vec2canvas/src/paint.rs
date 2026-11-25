@@ -283,8 +283,8 @@ impl CanvasGradientPaint {
         canvas: &dyn CanvasDevice,
         _ts: sk::Transform,
     ) -> Option<CanvasGradient> {
-        let aspect_ratio = self
-            .aspect_ratio
+        let aspect_ratio = gradient_style_aspect_ratio(&self.gradient)
+            .or(self.aspect_ratio)
             .or_else(|| self.transform.map(transform_aspect_ratio));
         create_canvas_gradient(canvas, &self.gradient, self.transform, aspect_ratio)
     }
@@ -342,9 +342,12 @@ impl CanvasGradientPaint {
             return self.aspect_ratio;
         }
 
-        self.transform
-            .filter(|transform| !transform.is_identity())
-            .and_then(valid_transform_aspect_ratio)
+        gradient_style_aspect_ratio(&self.gradient)
+            .or_else(|| {
+                self.transform
+                    .filter(|transform| !transform.is_identity())
+                    .and_then(valid_transform_aspect_ratio)
+            })
             .or_else(|| glyph_aspect_ratio(font, glyph))
             .or(self.aspect_ratio)
     }
@@ -368,9 +371,11 @@ impl CanvasGradientPaint {
                 center = *c;
             }
         }
+        let resolved_aspect_ratio =
+            resolve_conic_aspect_ratio(&self.gradient, transform, self.aspect_ratio);
 
         if prefer_native {
-            let paint_to_local = conic_paint_to_local(transform, self.aspect_ratio, center, ts);
+            let paint_to_local = conic_paint_to_local(transform, resolved_aspect_ratio, center);
             let canvas_transform = ts.pre_concat(paint_to_local);
             if is_invertible_sk_transform(canvas_transform) {
                 if let Some(gradient) =
@@ -396,8 +401,7 @@ impl CanvasGradientPaint {
             }
         }
 
-        let aspect_ratio = resolve_conic_aspect_ratio(transform, self.aspect_ratio, ts);
-        let inverse_ratio = 1.0 / aspect_ratio;
+        let inverse_ratio = 1.0 / resolved_aspect_ratio;
 
         let (fill_x, fill_y, fill_w, fill_h) = paint_space_fill_rect(clip_bounds, transform.into());
         let max_dx = (fill_x - f64::from(center.x.0))
@@ -478,6 +482,7 @@ impl CanvasGradientPaint {
                 GradientStyle::Center(c) => center = *c,
                 GradientStyle::FocalCenter(c) => focal_center = *c,
                 GradientStyle::FocalRadius(r) => focal_radius = *r,
+                GradientStyle::AspectRatio(_) => {}
             }
         }
 
@@ -539,61 +544,37 @@ fn set_invertible_transform(canvas: &dyn CanvasDevice, m: sk::Transform) -> bool
     true
 }
 
-fn is_orthogonal_sk_transform(m: sk::Transform) -> bool {
-    let w = f64::from(m.sx).hypot(f64::from(m.ky));
-    let h = f64::from(m.kx).hypot(f64::from(m.sy));
-    if !w.is_finite() || !h.is_finite() || w <= 1e-6 || h <= 1e-6 {
-        return false;
-    }
-    let dot = f64::from(m.sx) * f64::from(m.kx) + f64::from(m.ky) * f64::from(m.sy);
-    dot.abs() <= 1e-3 * w * h
-}
-
-fn valid_sk_transform_aspect_ratio(m: sk::Transform) -> Option<f32> {
-    let width = m.sx.hypot(m.ky);
-    let height = m.kx.hypot(m.sy);
-    if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
-        let ratio = width / height;
-        ratio.is_finite().then_some(ratio)
-    } else {
-        None
-    }
+fn gradient_style_aspect_ratio(gradient: &GradientItem) -> Option<f32> {
+    gradient.styles.iter().find_map(|style| match style {
+        GradientStyle::AspectRatio(ratio) if ratio.0.is_finite() && ratio.0 > 0.0 => Some(ratio.0),
+        _ => None,
+    })
 }
 
 fn resolve_conic_aspect_ratio(
+    gradient: &GradientItem,
     transform: Transform,
     aspect_ratio: Option<f32>,
-    ts: sk::Transform,
 ) -> f32 {
-    let paint_transform: sk::Transform = transform.into();
-    if is_orthogonal_sk_transform(paint_transform) {
-        return gradient_aspect_ratio(
-            aspect_ratio.or_else(|| valid_transform_aspect_ratio(transform)),
-        );
-    }
-
-    let screen_transform = ts.pre_concat(paint_transform);
-    if is_orthogonal_sk_transform(screen_transform) {
-        if let Some(ratio) = valid_sk_transform_aspect_ratio(screen_transform) {
-            return gradient_aspect_ratio(Some(ratio));
-        }
-    }
-
-    gradient_aspect_ratio(aspect_ratio.or_else(|| valid_transform_aspect_ratio(transform)))
+    gradient_aspect_ratio(
+        gradient_style_aspect_ratio(gradient)
+            .or(aspect_ratio)
+            .or_else(|| valid_transform_aspect_ratio(transform)),
+    )
 }
 
 /// Maps isotropic conic-gradient circle space `(u, v)` centered at `(0, 0)` into
 /// the element's local coordinate space by first scaling `(1 / aspect_ratio, 1)`
 /// around `center` in parent `[0, 1]^2` space and then applying `paint_transform`.
-/// Composing `ts.pre_concat(conic_paint_to_local(...))` preserves parent aspect-ratio
-/// correction while keeping any outer `#scale`, `#rotate`, or `#skew` intact.
+/// Composing `ts.pre_concat(conic_paint_to_local(...))` preserves the reference box's
+/// true aspect-ratio correction while keeping any outer `#scale`, `#rotate`, or `#skew`
+/// intact even when inner transforms (such as `#skew`) are nested inside the parent.
 pub(crate) fn conic_paint_to_local(
     transform: Transform,
-    aspect_ratio: Option<f32>,
+    aspect_ratio: f32,
     center: ir::Point,
-    ts: sk::Transform,
 ) -> sk::Transform {
-    let ratio = resolve_conic_aspect_ratio(transform, aspect_ratio, ts);
+    let ratio = gradient_aspect_ratio(Some(aspect_ratio));
     let paint_transform: sk::Transform = transform.into();
     let unit_circle_to_parent =
         sk::Transform::from_row(1.0 / ratio, 0.0, 0.0, 1.0, center.x.0, center.y.0);
@@ -695,6 +676,7 @@ fn create_canvas_gradient(
                     GradientStyle::Center(c) => center = *c,
                     GradientStyle::FocalCenter(c) => focal_center = *c,
                     GradientStyle::FocalRadius(r) => focal_radius = *r,
+                    GradientStyle::AspectRatio(_) => {}
                 }
             }
 

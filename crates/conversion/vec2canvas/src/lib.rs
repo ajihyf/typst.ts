@@ -1223,18 +1223,35 @@ mod tests {
         assert!(crate::expand_stroked_outline(outline, &zero_attrs, 0.2).is_none());
 
         // Conic paint transform must preserve outer non-uniform scale (160% x, 60% y) on a
-        // 220x100 parent block rather than normalizing away the outer scale.
+        // 220x100 parent block even when an inner skew is nested inside the parent block!
         let parent_block_ts = ir::Transform::from_scale(Scalar(220.0), Scalar(100.0));
         let outer_scaled_ts = sk::Transform::from_scale(3.0 * 1.6, 3.0 * 0.6);
         let conic_local = crate::conic_paint_to_local(
             parent_block_ts,
-            Some(2.2),
+            2.2,
             ir::Point::new(Scalar(0.37), Scalar(0.58)),
-            outer_scaled_ts,
         );
         let conic_screen = outer_scaled_ts.pre_concat(conic_local);
         // X-axis stretches by 1.6x, Y-axis compresses by 0.6x relative to the block's isotropic 100pt unit!
         assert!((conic_screen.sx / conic_screen.sy - (1.6 / 0.6)).abs() < 1e-3);
+
+        // Nested outer #scale(160%, 60%) + parent #block(100, 100) + inner #skew(25deg):
+        // inner skew cancels in `ts * paint_transform`, while explicit GradientStyle::AspectRatio(1.0)
+        // preserves the outer (1.6 / 0.6) scale ratio instead of normalizing it away.
+        let skew_k = 25.0_f32.to_radians().tan();
+        let inner_skew_inv = ir::Transform::from_skew(Scalar(-skew_k), Scalar(0.0));
+        let nested_paint_ts =
+            ir::Transform::from_scale(Scalar(100.0), Scalar(100.0)).post_concat(inner_skew_inv);
+        let nested_item_ts = sk::Transform::from_scale(3.0 * 1.6, 3.0 * 0.6)
+            .pre_concat(sk::Transform::from_row(1.0, 0.0, skew_k, 1.0, 0.0, 0.0));
+        let nested_conic_local = crate::conic_paint_to_local(
+            nested_paint_ts,
+            1.0,
+            ir::Point::new(Scalar(0.5), Scalar(0.5)),
+        );
+        let nested_conic_screen = nested_item_ts.pre_concat(nested_conic_local);
+        assert!(nested_conic_screen.kx.abs() < 1e-3 && nested_conic_screen.ky.abs() < 1e-3);
+        assert!((nested_conic_screen.sx / nested_conic_screen.sy - (1.6 / 0.6)).abs() < 1e-3);
 
         // Narrow parent box (14pt x 20pt) with wide overflowing glyph (75pt wide -> ~5.4x parent)
         // must compute a paint-space fill_rect strictly covering the entire glyph past x=4.0.
